@@ -1,0 +1,612 @@
+// billing.service.ts
+// ArcSub V2 — Backend Billing Engine
+//
+// Handles:
+//  - Scheduled billing (cron every minute)
+//  - Smart retry (6h / 24h / 48h, max 3 attempts)
+//  - Grace period tracking and auto-suspension
+//  - Usage metering API
+//  - Webhook delivery with signed payloads
+//  - Notifications
+//  - Analytics refresh
+//  - REST API endpoints (Express)
+
+import express, { Request, Response, NextFunction } from 'express'
+import { Pool }    from 'pg'
+import cron        from 'node-cron'
+import crypto      from 'crypto'
+import { createPublicClient, http, formatUnits } from 'viem'
+
+// ─────────────────────────────────────────────────────────────
+//  Arc Testnet client (viem)
+// ─────────────────────────────────────────────────────────────
+const arcClient = createPublicClient({
+  chain: {
+    id: 5042002,
+    name: 'Arc Testnet',
+    nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
+    rpcUrls: { default: { http: ['https://rpc.testnet.arc.network'] } },
+  },
+  transport: http('https://rpc.testnet.arc.network'),
+})
+
+// ─────────────────────────────────────────────────────────────
+//  Database pool
+// ─────────────────────────────────────────────────────────────
+const db = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 20,
+})
+
+// ─────────────────────────────────────────────────────────────
+//  Express app
+// ─────────────────────────────────────────────────────────────
+const app = express()
+app.use(express.json())
+
+// ═════════════════════════════════════════════════════════════
+//  BILLING ENGINE
+// ═════════════════════════════════════════════════════════════
+
+// ── 1. Process due payments ───────────────────────────────────
+async function processDuePayments() {
+  const { rows } = await db.query(
+    `SELECT s.*, p.name AS plan_name, p.grace_period_sec
+     FROM subscriptions s
+     JOIN plans p ON s.plan_id = p.id
+     WHERE s.status IN ('active','overdue')
+       AND s.next_payment <= NOW()
+       AND s.retry_count = 0`
+  )
+
+  for (const sub of rows) {
+    try {
+      const success = await attemptCharge(sub)
+      if (!success) {
+        await scheduleRetry(sub, 1)
+        if (sub.grace_period_sec > 0) {
+          await markOverdue(sub)
+        }
+      }
+    } catch (err) {
+      console.error(`[billing] payment error subId=${sub.id}:`, err)
+    }
+  }
+}
+
+// ── 2. Process retry queue ────────────────────────────────────
+async function processRetries() {
+  const { rows } = await db.query(
+    `SELECT * FROM subscriptions
+     WHERE retry_count > 0
+       AND retry_count <= 3
+       AND next_retry_at <= NOW()
+       AND status IN ('active','overdue','paused')`
+  )
+
+  for (const sub of rows) {
+    try {
+      const success = await attemptCharge(sub)
+      if (success) {
+        await db.query(
+          `UPDATE subscriptions
+           SET retry_count=0, failed_attempts=0, next_retry_at=NULL,
+               status='active', updated_at=NOW()
+           WHERE id=$1`,
+          [sub.id]
+        )
+        await sendNotification(sub.subscriber_wallet, 'payment_success',
+          `Your payment for ${sub.plan_name} was successful.`)
+        await sendMerchantNotification(sub.merchant_wallet, 'payment_success',
+          `Payment recovered for subscriber ${sub.subscriber_wallet}.`)
+      } else {
+        if (sub.retry_count >= 3) {
+          // All retries exhausted — pause subscription
+          await db.query(
+            `UPDATE subscriptions
+             SET status='paused', updated_at=NOW()
+             WHERE id=$1`,
+            [sub.id]
+          )
+          await sendNotification(sub.subscriber_wallet, 'payment_failed',
+            `Your subscription has been paused after 3 failed payment attempts.`)
+          await sendMerchantNotification(sub.merchant_wallet, 'payment_failed',
+            `Subscription ${sub.id} paused — 3 retries exhausted.`)
+          await dispatchWebhook(sub.merchant_wallet, 'payment_failed', sub)
+        } else {
+          await scheduleRetry(sub, sub.retry_count + 1)
+        }
+      }
+    } catch (err) {
+      console.error(`[retry] error subId=${sub.id}:`, err)
+    }
+  }
+}
+
+// ── 3. Check and suspend overdue subscriptions ────────────────
+async function processGraceExpiry() {
+  const { rows } = await db.query(
+    `SELECT s.*, p.name AS plan_name
+     FROM subscriptions s
+     JOIN plans p ON s.plan_id = p.id
+     WHERE s.status = 'overdue'
+       AND s.grace_period_end < NOW()`
+  )
+  for (const sub of rows) {
+    await db.query(
+      `UPDATE subscriptions SET status='suspended', updated_at=NOW() WHERE id=$1`,
+      [sub.id]
+    )
+    await sendNotification(sub.subscriber_wallet, 'grace_period',
+      `Your subscription to ${sub.plan_name} has been suspended.`)
+    await dispatchWebhook(sub.merchant_wallet, 'subscription_suspended', sub)
+  }
+}
+
+// ── 4. Trial ending reminders (2 days before) ─────────────────
+async function procesTrialReminders() {
+  const { rows } = await db.query(
+    `SELECT s.*, p.name AS plan_name
+     FROM subscriptions s
+     JOIN plans p ON s.plan_id = p.id
+     WHERE s.payment_count = 0
+       AND s.status = 'active'
+       AND s.next_payment BETWEEN NOW() AND NOW() + INTERVAL '2 days'`
+  )
+  for (const sub of rows) {
+    await sendNotification(sub.subscriber_wallet, 'trial_ending',
+      `Your free trial for ${sub.plan_name} ends in 2 days.`)
+    await dispatchWebhook(sub.merchant_wallet, 'trial_ending', sub)
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  CORE CHARGE LOGIC
+//  In practice this calls the on-chain contract via a relayer.
+//  Here we record the intent and track state; the on-chain tx
+//  is confirmed by listening to PaymentProcessed events.
+// ─────────────────────────────────────────────────────────────
+async function attemptCharge(sub: any): Promise<boolean> {
+  // Check if subscriber has sufficient balance on Arc
+  const balanceHex = await arcClient.getBalance({ address: sub.subscriber_wallet as `0x${string}` })
+  const balance    = parseFloat(formatUnits(balanceHex, 18))
+  const amount     = parseFloat(sub.amount)
+
+  // Try backup wallet if primary is insufficient
+  let payerWallet  = sub.subscriber_wallet
+  let usingBackup  = false
+
+  if (balance < amount && sub.backup_wallet) {
+    const backupBal = await arcClient.getBalance({ address: sub.backup_wallet as `0x${string}` })
+    const backupBalance = parseFloat(formatUnits(backupBal, 18))
+    if (backupBalance >= amount) {
+      payerWallet = sub.backup_wallet
+      usingBackup = true
+    } else {
+      await recordPaymentFailure(sub, `Insufficient balance: ${balance} < ${amount}`)
+      return false
+    }
+  } else if (balance < amount) {
+    await recordPaymentFailure(sub, `Insufficient balance: ${balance} < ${amount}`)
+    return false
+  }
+
+  // Record successful payment event
+  await db.query(
+    `INSERT INTO payment_events
+       (subscription_id, event_type, amount, attempt_number, metadata)
+     VALUES ($1, 'success', $2, $3, $4)`,
+    [
+      sub.id,
+      sub.amount,
+      sub.retry_count + 1,
+      JSON.stringify({ payer: payerWallet, usingBackup })
+    ]
+  )
+
+  // Compute next billing date
+  const intervalMap: Record<string, string> = {
+    weekly:   '7 days',
+    monthly:  '30 days',
+    annually: '365 days',
+  }
+  const interval = intervalMap[sub.interval_type] || `${sub.interval_seconds} seconds`
+
+  await db.query(
+    `UPDATE subscriptions
+     SET last_payment   = NOW(),
+         payment_count  = payment_count + 1,
+         failed_attempts= 0,
+         retry_count    = 0,
+         next_retry_at  = NULL,
+         grace_period_end = NULL,
+         status         = 'active',
+         next_payment   = NOW() + INTERVAL '${interval}',
+         updated_at     = NOW()
+     WHERE id = $1`,
+    [sub.id]
+  )
+
+  // Log payout split
+  const merchantPct  = (sub.merchant_share_bps  || 9500) / 10000
+  const platformPct  = (sub.platform_share_bps  || 500)  / 10000
+  const affiliatePct = (sub.affiliate_share_bps || 0)    / 10000
+  await db.query(
+    `INSERT INTO payout_logs
+       (subscription_id, merchant_amount, platform_amount, affiliate_amount, affiliate_wallet)
+     VALUES ($1,$2,$3,$4,$5)`,
+    [
+      sub.id,
+      amount * merchantPct,
+      amount * platformPct,
+      amount * affiliatePct,
+      sub.affiliate_wallet || null
+    ]
+  )
+
+  await dispatchWebhook(sub.merchant_wallet, 'payment_success', sub)
+  await refreshAnalytics(sub.merchant_wallet)
+  return true
+}
+
+async function recordPaymentFailure(sub: any, reason: string) {
+  await db.query(
+    `INSERT INTO payment_events
+       (subscription_id, event_type, amount, attempt_number, error_message)
+     VALUES ($1,'failed',$2,$3,$4)`,
+    [sub.id, sub.amount, sub.retry_count + 1, reason]
+  )
+  await db.query(
+    `UPDATE subscriptions
+     SET failed_attempts = failed_attempts + 1,
+         updated_at = NOW()
+     WHERE id = $1`,
+    [sub.id]
+  )
+}
+
+async function scheduleRetry(sub: any, attempt: number) {
+  const delayMap: Record<number, string> = {
+    1: '6 hours',
+    2: '24 hours',
+    3: '48 hours',
+  }
+  const delay = delayMap[attempt] || '48 hours'
+  await db.query(
+    `UPDATE subscriptions
+     SET retry_count   = $1,
+         next_retry_at = NOW() + INTERVAL '${delay}',
+         updated_at    = NOW()
+     WHERE id = $2`,
+    [attempt, sub.id]
+  )
+  await sendNotification(sub.subscriber_wallet, 'retry_scheduled',
+    `Payment retry #${attempt} scheduled in ${delay}.`)
+}
+
+async function markOverdue(sub: any) {
+  const { rows } = await db.query(`SELECT grace_period_sec FROM plans WHERE id=$1`, [sub.plan_id])
+  const graceSec = rows[0]?.grace_period_sec || 0
+  if (graceSec > 0) {
+    await db.query(
+      `UPDATE subscriptions
+       SET status='overdue',
+           grace_period_end = NOW() + (${graceSec} * INTERVAL '1 second'),
+           updated_at=NOW()
+       WHERE id=$1`,
+      [sub.id]
+    )
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  WEBHOOK DELIVERY
+// ─────────────────────────────────────────────────────────────
+async function dispatchWebhook(merchantWallet: string, eventType: string, payload: any) {
+  const { rows } = await db.query(
+    `SELECT id, webhook_url, webhook_secret FROM merchants WHERE wallet_address=$1`,
+    [merchantWallet]
+  )
+  if (!rows.length || !rows[0].webhook_url) return
+
+  const merchant  = rows[0]
+  const body      = JSON.stringify({ event: eventType, data: payload, timestamp: Date.now() })
+  const signature = crypto
+    .createHmac('sha256', merchant.webhook_secret)
+    .update(body)
+    .digest('hex')
+
+  await db.query(
+    `INSERT INTO webhook_deliveries
+       (merchant_id, event_type, payload, signature, url)
+     VALUES ($1,$2,$3,$4,$5)`,
+    [merchant.id, eventType, payload, `sha256=${signature}`, merchant.webhook_url]
+  )
+
+  // Deliver asynchronously
+  setImmediate(async () => {
+    let attempts = 0
+    while (attempts < 3) {
+      try {
+        const res = await fetch(merchant.webhook_url, {
+          method:  'POST',
+          headers: {
+            'Content-Type':     'application/json',
+            'X-ArcSub-Sig':     `sha256=${signature}`,
+            'X-ArcSub-Event':   eventType,
+          },
+          body,
+          signal: AbortSignal.timeout(10_000),
+        })
+        await db.query(
+          `UPDATE webhook_deliveries
+           SET status_code=$1, delivered_at=NOW(), attempts=$2
+           WHERE merchant_id=$3 AND event_type=$4
+           ORDER BY created_at DESC LIMIT 1`,
+          [res.status, attempts + 1, merchant.id, eventType]
+        )
+        break
+      } catch (e) {
+        attempts++
+        if (attempts < 3) await sleep(2000 * attempts)
+      }
+    }
+  })
+}
+
+// ─────────────────────────────────────────────────────────────
+//  NOTIFICATIONS
+// ─────────────────────────────────────────────────────────────
+async function sendNotification(wallet: string, type: string, body: string) {
+  await db.query(
+    `INSERT INTO notifications (recipient_wallet, channel, type, body)
+     VALUES ($1,'in_app',$2,$3)`,
+    [wallet, type, body]
+  )
+  // Extend: push to email/Telegram/push service here
+}
+
+async function sendMerchantNotification(wallet: string, type: string, body: string) {
+  await sendNotification(wallet, type, body)
+}
+
+// ─────────────────────────────────────────────────────────────
+//  ANALYTICS
+// ─────────────────────────────────────────────────────────────
+async function refreshAnalytics(merchantWallet: string) {
+  const period = new Date().toISOString().slice(0, 7)   // 'YYYY-MM'
+  await db.query(`SELECT refresh_merchant_analytics($1,$2)`, [merchantWallet, period])
+}
+
+// ─────────────────────────────────────────────────────────────
+//  REST API
+// ─────────────────────────────────────────────────────────────
+
+// ── Auth middleware (API key) ─────────────────────────────────
+async function apiAuth(req: Request, res: Response, next: NextFunction) {
+  const key = req.headers['x-api-key'] as string
+  if (!key) return res.status(401).json({ error: 'Missing API key' })
+  const { rows } = await db.query(
+    `SELECT * FROM merchants WHERE api_key=$1`, [key]
+  )
+  if (!rows.length) return res.status(403).json({ error: 'Invalid API key' })
+  ;(req as any).merchant = rows[0]
+  next()
+}
+
+// ── Plans ─────────────────────────────────────────────────────
+app.post('/api/plans', apiAuth, async (req, res) => {
+  const m = (req as any).merchant
+  const { name, description, price, interval_type, trial_days,
+          grace_period_sec, pause_allowed, token_symbol, token_address } = req.body
+  const { rows } = await db.query(
+    `INSERT INTO plans
+       (merchant_id, merchant_wallet, name, description, price, interval_type,
+        trial_days, grace_period_sec, pause_allowed, token_symbol, token_address)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+     RETURNING *`,
+    [m.id, m.wallet_address, name, description, price, interval_type,
+     trial_days||0, grace_period_sec||0, pause_allowed!==false, token_symbol||'USDC', token_address]
+  )
+  res.json({ plan: rows[0] })
+})
+
+app.get('/api/plans', apiAuth, async (req, res) => {
+  const m = (req as any).merchant
+  const { rows } = await db.query(
+    `SELECT * FROM plans WHERE merchant_id=$1 ORDER BY created_at DESC`, [m.id]
+  )
+  res.json({ plans: rows })
+})
+
+app.patch('/api/plans/:id', apiAuth, async (req, res) => {
+  const m = (req as any).merchant
+  const { price, grace_period_sec, pause_allowed, is_active } = req.body
+  const { rows } = await db.query(
+    `UPDATE plans SET price=COALESCE($1,price), grace_period_sec=COALESCE($2,grace_period_sec),
+     pause_allowed=COALESCE($3,pause_allowed), is_active=COALESCE($4,is_active)
+     WHERE id=$5 AND merchant_id=$6 RETURNING *`,
+    [price, grace_period_sec, pause_allowed, is_active, req.params.id, m.id]
+  )
+  rows.length ? res.json({ plan: rows[0] }) : res.status(404).json({ error: 'Plan not found' })
+})
+
+// ── Subscriptions ─────────────────────────────────────────────
+app.get('/api/subscribers/:wallet/status', apiAuth, async (req, res) => {
+  const { rows } = await db.query(
+    `SELECT s.*, p.name AS plan_name
+     FROM subscriptions s
+     JOIN plans p ON s.plan_id = p.id
+     WHERE s.subscriber_wallet = $1
+       AND s.merchant_id = $2
+       AND s.status NOT IN ('cancelled','expired')`,
+    [req.params.wallet, (req as any).merchant.id]
+  )
+  res.json({ subscriptions: rows })
+})
+
+app.get('/api/subscriptions/:id', apiAuth, async (req, res) => {
+  const { rows } = await db.query(
+    `SELECT s.*, p.name AS plan_name
+     FROM subscriptions s
+     JOIN plans p ON s.plan_id = p.id
+     WHERE s.id=$1 AND s.merchant_id=$2`,
+    [req.params.id, (req as any).merchant.id]
+  )
+  rows.length ? res.json({ subscription: rows[0] }) : res.status(404).json({ error: 'Not found' })
+})
+
+app.get('/api/subscriptions/:id/history', apiAuth, async (req, res) => {
+  const { rows } = await db.query(
+    `SELECT * FROM payment_events
+     WHERE subscription_id=$1
+     ORDER BY created_at DESC LIMIT 50`,
+    [req.params.id]
+  )
+  res.json({ history: rows })
+})
+
+// ── Coupons ───────────────────────────────────────────────────
+app.post('/api/coupons', apiAuth, async (req, res) => {
+  const m = (req as any).merchant
+  const { code, discount_bps, fixed_discount, trial_ext_days,
+          expires_at, max_uses, plan_id } = req.body
+  const { rows } = await db.query(
+    `INSERT INTO coupons
+       (code, merchant_id, discount_bps, fixed_discount, trial_ext_days,
+        expires_at, max_uses, plan_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+     RETURNING *`,
+    [code, m.id, discount_bps||0, fixed_discount||0, trial_ext_days||0,
+     expires_at||null, max_uses||0, plan_id||null]
+  )
+  res.json({ coupon: rows[0] })
+})
+
+app.get('/api/coupons/validate/:code', async (req, res) => {
+  const { rows } = await db.query(
+    `SELECT * FROM coupons
+     WHERE code=$1
+       AND is_active=true
+       AND (expires_at IS NULL OR expires_at > NOW())
+       AND (max_uses = 0 OR used_count < max_uses)`,
+    [req.params.code]
+  )
+  rows.length
+    ? res.json({ valid: true, coupon: rows[0] })
+    : res.json({ valid: false, reason: 'Invalid or expired coupon' })
+})
+
+// ── Usage metering ────────────────────────────────────────────
+app.post('/api/usage', apiAuth, async (req, res) => {
+  const { subscription_id, usage_type, usage_units, price_per_unit } = req.body
+  const period = new Date().toISOString().slice(0, 7)
+  const total  = (usage_units * price_per_unit).toFixed(18)
+
+  const { rows } = await db.query(
+    `INSERT INTO usage_records
+       (subscription_id, billing_period, usage_type, usage_units, price_per_unit, total_charge)
+     VALUES ($1,$2,$3,$4,$5,$6)
+     ON CONFLICT DO NOTHING RETURNING *`,
+    [subscription_id, period, usage_type, usage_units, price_per_unit, total]
+  )
+  res.json({ record: rows[0] })
+})
+
+app.get('/api/usage/:subId', apiAuth, async (req, res) => {
+  const { rows } = await db.query(
+    `SELECT * FROM usage_records WHERE subscription_id=$1 ORDER BY created_at DESC`,
+    [req.params.subId]
+  )
+  res.json({ records: rows })
+})
+
+// ── Analytics ─────────────────────────────────────────────────
+app.get('/api/analytics', apiAuth, async (req, res) => {
+  const m      = (req as any).merchant
+  const period = (req.query.period as string) || new Date().toISOString().slice(0, 7)
+  const { rows } = await db.query(
+    `SELECT * FROM merchant_analytics
+     WHERE merchant_wallet=$1 AND period=$2`,
+    [m.wallet_address, period]
+  )
+  // Also fetch plan breakdown
+  const { rows: plans } = await db.query(
+    `SELECT p.name, COUNT(s.id) AS subscribers,
+            SUM(CASE WHEN s.status='active' THEN s.amount ELSE 0 END) AS mrr
+     FROM subscriptions s
+     JOIN plans p ON s.plan_id = p.id
+     WHERE s.merchant_wallet=$1
+     GROUP BY p.name`,
+    [m.wallet_address]
+  )
+  res.json({ analytics: rows[0] || {}, planBreakdown: plans })
+})
+
+// ── Referrals ─────────────────────────────────────────────────
+app.get('/api/referrals', apiAuth, async (req, res) => {
+  const m = (req as any).merchant
+  const { rows } = await db.query(
+    `SELECT r.*, s.subscriber_wallet
+     FROM referral_events r
+     JOIN subscriptions s ON r.subscription_id = s.id
+     WHERE s.merchant_wallet=$1
+     ORDER BY r.created_at DESC`,
+    [m.wallet_address]
+  )
+  res.json({ referrals: rows })
+})
+
+// ── Notifications ─────────────────────────────────────────────
+app.get('/api/notifications/:wallet', async (req, res) => {
+  const { rows } = await db.query(
+    `SELECT * FROM notifications
+     WHERE recipient_wallet=$1
+     ORDER BY created_at DESC LIMIT 50`,
+    [req.params.wallet]
+  )
+  res.json({ notifications: rows })
+})
+
+app.patch('/api/notifications/:id/read', async (req, res) => {
+  await db.query(
+    `UPDATE notifications SET read_at=NOW() WHERE id=$1`, [req.params.id]
+  )
+  res.json({ ok: true })
+})
+
+// ─────────────────────────────────────────────────────────────
+//  CRON JOBS
+// ─────────────────────────────────────────────────────────────
+// Every minute: process due payments
+cron.schedule('* * * * *', async () => {
+  try { await processDuePayments()  } catch(e) { console.error('[cron] billing:', e) }
+})
+
+// Every 5 minutes: process retries
+cron.schedule('*/5 * * * *', async () => {
+  try { await processRetries()      } catch(e) { console.error('[cron] retries:', e) }
+})
+
+// Every 10 minutes: check grace period expiry
+cron.schedule('*/10 * * * *', async () => {
+  try { await processGraceExpiry()  } catch(e) { console.error('[cron] grace:', e) }
+})
+
+// Daily at 09:00 UTC: trial reminders
+cron.schedule('0 9 * * *', async () => {
+  try { await procesTrialReminders()} catch(e) { console.error('[cron] trials:', e) }
+})
+
+// ─────────────────────────────────────────────────────────────
+//  UTILS
+// ─────────────────────────────────────────────────────────────
+function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)) }
+
+// ─────────────────────────────────────────────────────────────
+//  SERVER
+// ─────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 4000
+app.listen(PORT, () => console.log(`ArcSub V2 billing service on :${PORT}`))
+
+export { app, db }
