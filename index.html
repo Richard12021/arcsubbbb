@@ -1,612 +1,2417 @@
-// billing.service.ts
-// ArcSub V2 — Backend Billing Engine
-//
-// Handles:
-//  - Scheduled billing (cron every minute)
-//  - Smart retry (6h / 24h / 48h, max 3 attempts)
-//  - Grace period tracking and auto-suspension
-//  - Usage metering API
-//  - Webhook delivery with signed payloads
-//  - Notifications
-//  - Analytics refresh
-//  - REST API endpoints (Express)
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ArcSub — Recurring Payments on Arc</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@300;400;500&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg-0:#04060e; --bg-1:#080d1a; --bg-2:#0d1525; --bg-3:#121c30; --bg-4:#1a2540;
+  --border:rgba(56,90,148,0.28); --border-hi:rgba(56,160,220,0.45);
+  --cyan:#38c8f0; --cyan-dim:rgba(56,200,240,0.10);
+  --gold:#f0b840; --gold-dim:rgba(240,184,64,0.10);
+  --green:#3cf0a0; --green-dim:rgba(60,240,160,0.08);
+  --red:#f05060; --red-dim:rgba(240,80,96,0.08);
+  --purple:#9b7ff0;
+  --text-0:#e8edf8; --text-1:#9aaac8; --text-2:#5a6a88; --text-3:#2e3d5c;
+  --font-d:'Syne',sans-serif; --font-m:'JetBrains Mono',monospace; --font-b:'DM Sans',sans-serif;
+  --r-sm:4px; --r-md:8px; --r-lg:14px; --r-xl:20px;
+  --glow-cyan:0 0 24px rgba(56,200,240,0.18),0 0 60px rgba(56,200,240,0.06);
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{font-family:var(--font-b);background:var(--bg-0);color:var(--text-0);min-height:100vh;overflow-x:hidden;font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased}
+body::before{content:'';position:fixed;inset:0;background-image:radial-gradient(ellipse 80% 50% at 20% -10%,rgba(56,200,240,0.07) 0%,transparent 60%),radial-gradient(ellipse 60% 40% at 80% 110%,rgba(240,184,64,0.04) 0%,transparent 60%);pointer-events:none;z-index:0}
+body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.025) 2px,rgba(0,0,0,0.025) 4px);pointer-events:none;z-index:0}
+#app{position:relative;z-index:1}
 
-import express, { Request, Response, NextFunction } from 'express'
-import { Pool }    from 'pg'
-import cron        from 'node-cron'
-import crypto      from 'crypto'
-import { createPublicClient, http, formatUnits } from 'viem'
+/* ── NAV ── */
+.nav{position:fixed;top:0;left:0;right:0;z-index:100;height:60px;background:rgba(4,6,14,.92);backdrop-filter:blur(18px);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 24px;gap:0}
+.nav-logo{font-family:var(--font-d);font-weight:800;font-size:19px;color:var(--text-0);letter-spacing:-.5px;margin-right:auto;cursor:pointer;display:flex;align-items:center;gap:9px;text-decoration:none;flex-shrink:0}
+.nav-logo-icon{width:30px;height:30px;background:linear-gradient(135deg,var(--cyan),#7b5ff0);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;color:#fff;box-shadow:var(--glow-cyan)}
+.nav-logo span{color:var(--cyan)}
+.nav-links{display:flex;gap:2px;margin-right:14px}
+.nav-link{padding:6px 13px;border-radius:4px;font-size:13px;font-weight:500;color:var(--text-1);cursor:pointer;transition:all .15s;border:1px solid transparent;background:none;font-family:var(--font-b)}
+.nav-link:hover{color:var(--text-0);background:var(--bg-3)}
+.nav-link.active{color:var(--cyan);background:var(--cyan-dim);border-color:var(--border-hi)}
 
-// ─────────────────────────────────────────────────────────────
-//  Arc Testnet client (viem)
-// ─────────────────────────────────────────────────────────────
-const arcClient = createPublicClient({
-  chain: {
-    id: 5042002,
-    name: 'Arc Testnet',
-    nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
-    rpcUrls: { default: { http: ['https://rpc.testnet.arc.network'] } },
-  },
-  transport: http('https://rpc.testnet.arc.network'),
+/* UTC clock */
+.utc-clock{font-family:var(--font-m);font-size:10px;color:var(--text-2);letter-spacing:.5px;margin-right:12px;padding:4px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-2);white-space:nowrap;min-width:158px;text-align:center}
+
+/* Chain tag */
+.chain-tag{font-family:var(--font-m);font-size:10px;color:var(--text-2);letter-spacing:1px;margin-right:12px;padding:2px 8px;border:1px solid var(--border);border-radius:4px;white-space:nowrap}
+
+/* Balance pill */
+.balance-pill{display:flex;align-items:center;gap:6px;padding:5px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-2);font-family:var(--font-m);font-size:12px;color:var(--text-1);transition:color .4s;white-space:nowrap;margin-right:8px}
+.balance-pill.flash-down{color:var(--red)!important;border-color:rgba(240,80,96,.3)}
+.balance-pill.flash-up{color:var(--green)!important;border-color:rgba(60,240,160,.3)}
+
+/* Wallet buttons */
+.wallet-btn-connect{display:flex;align-items:center;gap:7px;padding:8px 16px;border-radius:8px;font-size:13px;font-family:var(--font-d);font-weight:600;cursor:pointer;border:1px solid var(--border-hi);background:var(--cyan-dim);color:var(--cyan);transition:all .2s;white-space:nowrap}
+.wallet-btn-connect:hover{background:rgba(56,200,240,.18);box-shadow:var(--glow-cyan)}
+.wallet-btn-addr{display:flex;align-items:center;gap:7px;padding:7px 13px;border-radius:8px;font-size:12px;font-family:var(--font-m);cursor:pointer;border:1px solid rgba(60,240,160,.35);background:rgba(60,240,160,.07);color:var(--green);transition:all .15s;white-space:nowrap;position:relative}
+.wallet-dot{width:6px;height:6px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green);animation:pulse 2s infinite;flex-shrink:0}
+
+/* Disconnect dropdown */
+.disconnect-drop{position:absolute;top:calc(100% + 8px);right:0;background:var(--bg-2);border:1px solid var(--border-hi);border-radius:var(--r-lg);min-width:220px;box-shadow:0 12px 40px rgba(0,0,0,.5);overflow:hidden;z-index:200;animation:fadeUp .18s ease both}
+.drop-item{padding:11px 16px;font-family:var(--font-m);font-size:12px;cursor:pointer;transition:background .15s;display:flex;justify-content:space-between;align-items:center}
+.drop-item:hover{background:var(--bg-3)}
+.drop-item.danger{color:var(--red)}
+.drop-item.danger:hover{background:var(--red-dim)}
+
+/* Pages */
+.page{display:none;padding-top:60px;min-height:100vh}
+.page.active{display:block}
+
+/* ── WALLET MODAL ── */
+.wallet-modal-overlay{position:fixed;inset:0;z-index:300;background:rgba(4,6,14,.85);backdrop-filter:blur(10px);display:flex;align-items:center;justify-content:center;padding:24px;animation:fadeIn .2s ease both}
+.wallet-modal{background:var(--bg-1);border:1px solid var(--border-hi);border-radius:var(--r-xl);width:100%;max-width:420px;box-shadow:0 24px 80px rgba(0,0,0,.5),var(--glow-cyan);animation:fadeUp .22s ease both}
+.wallet-option{display:flex;align-items:center;gap:16px;padding:18px 20px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--r-lg);cursor:pointer;transition:all .18s;position:relative;overflow:hidden}
+.wallet-option:hover{transform:translateY(-1px)}
+.wallet-option.connecting{animation:walletPulse 1.2s infinite}
+.wallet-option-logo{width:52px;height:52px;border-radius:12px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.wallet-badge{font-family:var(--font-m);font-size:9px;padding:2px 6px;border-radius:4px;letter-spacing:.5px}
+.wallet-badge.detected{color:var(--green);background:var(--green-dim);border:1px solid rgba(60,240,160,.2)}
+.wallet-badge.install{color:var(--gold);background:var(--gold-dim);border:1px solid rgba(240,184,64,.2)}
+
+/* ── LAYOUT ── */
+.page-layout{display:grid;grid-template-columns:220px 1fr;min-height:calc(100vh - 60px)}
+.sidebar{background:var(--bg-1);border-right:1px solid var(--border);padding:20px 0;position:sticky;top:60px;height:calc(100vh - 60px);overflow-y:auto;display:flex;flex-direction:column}
+.sidebar-label{font-family:var(--font-m);font-size:10px;letter-spacing:1.5px;color:var(--text-3);text-transform:uppercase;padding:0 14px;margin-bottom:6px}
+.sidebar-item{display:flex;align-items:center;gap:10px;padding:9px 14px;border-radius:var(--r-md);font-size:13px;color:var(--text-1);cursor:pointer;transition:all .15s;border:1px solid transparent;margin:1px 8px}
+.sidebar-item:hover{background:var(--bg-3);color:var(--text-0)}
+.sidebar-item.active{background:var(--cyan-dim);color:var(--cyan);border-color:rgba(56,200,240,.18)}
+.sidebar-badge{margin-left:auto;background:var(--bg-4);color:var(--text-2);font-family:var(--font-m);font-size:10px;padding:2px 6px;border-radius:99px}
+.sidebar-item.active .sidebar-badge{background:rgba(56,200,240,.18);color:var(--cyan)}
+.page-content{padding:32px;overflow-y:auto;min-width:0}
+
+/* ── CARDS ── */
+.card{background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden;transition:border-color .2s}
+.card:hover{border-color:var(--border-hi)}
+.card-header{padding:17px 22px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.card-title{font-family:var(--font-d);font-weight:600;font-size:15px}
+.card-body{padding:22px}
+
+/* ── STAT CARDS ── */
+.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:28px}
+.stat-card{background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden;transition:border-color .2s;position:relative}
+.stat-card:hover{border-color:var(--border-hi)}
+.stat-card .top-bar{height:2px;width:100%}
+.stat-card-inner{padding:20px 22px}
+.stat-label{font-family:var(--font-m);font-size:10px;letter-spacing:1px;color:var(--text-2);text-transform:uppercase;margin-bottom:10px}
+.stat-value{font-family:var(--font-m);font-size:28px;font-weight:400;margin-bottom:6px;line-height:1;transition:all .4s}
+.stat-value.flash{animation:statFlash .6s ease}
+.stat-delta{font-family:var(--font-m);font-size:11px;color:var(--text-2)}
+.stat-delta.up{color:var(--green)}
+.stat-delta.down{color:var(--red)}
+
+/* ── BUTTONS ── */
+.btn-primary{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:10px 22px;background:var(--cyan);color:var(--bg-0);border:none;border-radius:var(--r-md);font-family:var(--font-d);font-weight:700;font-size:13px;cursor:pointer;transition:all .2s;box-shadow:var(--glow-cyan);white-space:nowrap}
+.btn-primary:hover{background:#5dd8f8;transform:translateY(-1px);box-shadow:0 0 40px rgba(56,200,240,.3)}
+.btn-primary:disabled{opacity:.5;cursor:not-allowed;transform:none}
+.btn-secondary{display:inline-flex;align-items:center;gap:8px;padding:10px 22px;background:transparent;color:var(--text-0);border:1px solid var(--border);border-radius:var(--r-md);font-family:var(--font-d);font-weight:600;font-size:13px;cursor:pointer;transition:all .2s;white-space:nowrap}
+.btn-secondary:hover{border-color:var(--border-hi);background:var(--bg-3)}
+.btn-ghost{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;background:transparent;color:var(--text-1);border:1px solid var(--border);border-radius:var(--r-md);font-family:var(--font-b);font-weight:500;font-size:12px;cursor:pointer;transition:all .2s;white-space:nowrap}
+.btn-ghost:hover{border-color:var(--border-hi);color:var(--text-0);background:var(--bg-3)}
+.btn-danger{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;background:var(--red-dim);color:var(--red);border:1px solid rgba(240,80,96,.25);border-radius:var(--r-md);font-family:var(--font-b);font-weight:500;font-size:12px;cursor:pointer;transition:all .2s;white-space:nowrap}
+.btn-danger:hover{background:rgba(240,80,96,.15)}
+
+/* ── BADGES ── */
+.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:var(--r-sm);font-family:var(--font-m);font-size:10px;font-weight:500;letter-spacing:.5px;text-transform:uppercase;white-space:nowrap}
+.badge::before{content:'';width:5px;height:5px;border-radius:50%;flex-shrink:0}
+.badge-active{background:var(--green-dim);color:var(--green);border:1px solid rgba(60,240,160,.2)}
+.badge-active::before{background:var(--green);box-shadow:0 0 4px var(--green);animation:pulse 2s infinite}
+.badge-paused{background:var(--gold-dim);color:var(--gold);border:1px solid rgba(240,184,64,.2)}
+.badge-paused::before{background:var(--gold)}
+.badge-cancelled{background:var(--red-dim);color:var(--red);border:1px solid rgba(240,80,96,.2)}
+.badge-cancelled::before{background:var(--red)}
+.badge-inactive{background:var(--bg-3);color:var(--text-2);border:1px solid var(--border)}
+.badge-inactive::before{background:var(--text-2)}
+
+/* ── TABLE ── */
+.data-table{width:100%;border-collapse:collapse}
+.data-table th{font-family:var(--font-m);font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--text-2);padding:11px 16px;text-align:left;border-bottom:1px solid var(--border);background:var(--bg-0);white-space:nowrap}
+.data-table td{padding:13px 16px;font-size:13px;border-bottom:1px solid var(--border);white-space:nowrap}
+.data-table tbody tr{transition:background .15s;cursor:pointer}
+.data-table tbody tr:hover{background:var(--bg-2)}
+.data-table tbody tr:last-child td{border-bottom:none}
+.td-mono{font-family:var(--font-m);font-size:12px}
+
+/* ── FORMS ── */
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.form-group{display:flex;flex-direction:column;gap:6px}
+.form-group.span-2{grid-column:span 2}
+label.field-label{font-family:var(--font-m);font-size:10px;letter-spacing:1px;color:var(--text-2);text-transform:uppercase}
+.input{width:100%;background:var(--bg-0);border:1px solid var(--border);border-radius:var(--r-md);color:var(--text-0);font-family:var(--font-b);font-size:13px;padding:10px 14px;transition:all .15s;outline:none}
+.input:focus{border-color:var(--border-hi);box-shadow:0 0 0 3px rgba(56,200,240,.07)}
+.input::placeholder{color:var(--text-3)}
+select.input{cursor:pointer;-webkit-appearance:none}
+textarea.input{resize:vertical;min-height:72px}
+.input-wrap{position:relative}
+.input-suffix{position:absolute;right:0;top:0;bottom:0;display:flex;align-items:center;padding:0 12px;font-family:var(--font-m);font-size:11px;color:var(--text-2);border-left:1px solid var(--border);background:var(--bg-2);border-radius:0 var(--r-md) var(--r-md) 0;pointer-events:none}
+.interval-toggle{display:flex;gap:8px}
+.interval-opt{flex:1;padding:10px 8px;text-align:center;background:var(--bg-0);border:1px solid var(--border);border-radius:var(--r-md);font-size:12px;font-family:var(--font-b);color:var(--text-1);cursor:pointer;transition:all .15s}
+.interval-opt:hover{border-color:var(--border-hi);color:var(--text-0)}
+.interval-opt.selected{background:var(--cyan-dim);border-color:var(--border-hi);color:var(--cyan)}
+.token-row{display:flex;gap:8px}
+.token-opt{flex:1;padding:10px 14px;background:var(--bg-0);border:1px solid var(--border);border-radius:var(--r-md);font-family:var(--font-m);font-size:13px;cursor:pointer;transition:all .15s;color:var(--text-1);display:flex;align-items:center;gap:8px;justify-content:center}
+.token-opt.selected{background:var(--cyan-dim);border-color:var(--border-hi);color:var(--cyan)}
+.token-icon{width:20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:#fff}
+
+/* ── MODAL ── */
+.modal-overlay{position:fixed;inset:0;z-index:200;background:rgba(4,6,14,.85);backdrop-filter:blur(10px);display:flex;align-items:center;justify-content:center;padding:24px;animation:fadeIn .2s ease both}
+.modal{background:var(--bg-1);border:1px solid var(--border-hi);border-radius:var(--r-xl);width:100%;max-width:560px;max-height:90vh;overflow-y:auto;box-shadow:0 24px 80px rgba(0,0,0,.5),var(--glow-cyan);animation:fadeUp .22s ease both}
+.modal-header{padding:24px 28px 0;display:flex;align-items:flex-start;justify-content:space-between}
+.modal-title{font-family:var(--font-d);font-weight:700;font-size:22px;letter-spacing:-.5px}
+.modal-close{width:32px;height:32px;border-radius:8px;background:var(--bg-3);border:1px solid var(--border);color:var(--text-1);cursor:pointer;font-size:18px;line-height:1;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.modal-close:hover{background:var(--bg-4);color:var(--text-0)}
+.modal-body{padding:20px 28px 28px}
+.breakdown-row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:13px}
+.breakdown-row:last-child{border-bottom:none}
+.breakdown-row.total{font-family:var(--font-m);font-size:14px;font-weight:500;color:var(--cyan);padding-top:10px}
+
+/* ── PLAN CARDS ── */
+.plan-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.plan-card{background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r-lg);padding:22px;cursor:pointer;transition:all .2s;display:flex;flex-direction:column;position:relative;overflow:hidden}
+.plan-card:hover{border-color:var(--border-hi);background:var(--bg-2);transform:translateY(-2px);box-shadow:0 8px 32px rgba(0,0,0,.3)}
+
+/* ── SUBSCRIPTION CARD ── */
+.sub-card{background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r-lg);padding:24px;transition:border-color .2s}
+.sub-timeline{display:flex;margin-bottom:18px}
+.sub-tl-item{flex:1;padding:11px 14px;background:var(--bg-0);border:1px solid var(--border);border-right:none}
+.sub-tl-item:first-child{border-radius:var(--r-md) 0 0 var(--r-md)}
+.sub-tl-item:last-child{border-right:1px solid var(--border);border-radius:0 var(--r-md) var(--r-md) 0}
+.sub-tl-label{font-family:var(--font-m);font-size:9px;color:var(--text-3);letter-spacing:1px;text-transform:uppercase;margin-bottom:4px}
+.sub-tl-val{font-family:var(--font-m);font-size:12px}
+
+/* ── HERO ── */
+.hero{min-height:calc(100vh - 60px);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:60px 24px;position:relative;overflow:hidden}
+.hero-grid{position:absolute;inset:0;background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);background-size:48px 48px;mask-image:radial-gradient(ellipse 80% 70% at 50% 50%,black,transparent);opacity:.35}
+.hero-badge{display:inline-flex;align-items:center;gap:8px;padding:5px 16px;border:1px solid var(--border-hi);border-radius:99px;background:var(--cyan-dim);font-family:var(--font-m);font-size:11px;color:var(--cyan);letter-spacing:1px;margin-bottom:32px;animation:fadeUp .6s ease both}
+.hero-dot{width:6px;height:6px;border-radius:50%;background:var(--cyan);box-shadow:0 0 8px var(--cyan);animation:pulse 2s infinite;flex-shrink:0}
+.hero-title{font-family:var(--font-d);font-weight:800;font-size:clamp(38px,6vw,72px);line-height:1.0;letter-spacing:-2px;margin-bottom:24px;animation:fadeUp .6s .1s ease both}
+.hero-title .grad{background:linear-gradient(90deg,var(--cyan),var(--gold));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.hero-sub{font-size:17px;color:var(--text-1);max-width:500px;margin:0 auto 44px;line-height:1.65;font-weight:300;animation:fadeUp .6s .2s ease both}
+.hero-ctas{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;animation:fadeUp .6s .3s ease both}
+.hero-stats{display:flex;gap:40px;justify-content:center;margin-top:72px;flex-wrap:wrap;animation:fadeUp .6s .4s ease both}
+.hero-stat{text-align:center}
+.hero-stat-val{font-family:var(--font-m);font-size:26px;font-weight:400;color:var(--cyan);display:block}
+.hero-stat-lbl{font-family:var(--font-m);font-size:10px;color:var(--text-2);letter-spacing:1px;text-transform:uppercase}
+.hero-stat-div{width:1px;background:var(--border)}
+
+/* ── BAR CHART ── */
+.bar-chart{display:flex;align-items:flex-end;gap:6px;height:140px}
+.bar-wrap{flex:1;display:flex;flex-direction:column;align-items:center;height:100%}
+.bar{width:100%;border-radius:4px 4px 0 0;cursor:pointer;transition:opacity .15s;position:relative}
+.bar:hover{opacity:.75}
+.bar-label{font-family:var(--font-m);font-size:9px;color:var(--text-2);margin-top:6px;letter-spacing:.5px}
+
+/* ── TOAST ── */
+.toast-wrap{position:fixed;bottom:28px;right:28px;z-index:999;display:flex;flex-direction:column;gap:10px;width:340px;pointer-events:none}
+.toast{background:var(--bg-2);border:1px solid var(--border-hi);border-radius:12px;padding:14px 16px;display:flex;gap:12px;align-items:flex-start;box-shadow:0 8px 32px rgba(0,0,0,.4);animation:fadeUp .3s ease both;pointer-events:all}
+.toast-icon{font-size:16px;font-family:var(--font-m);flex-shrink:0}
+.toast-title{font-family:var(--font-m);font-size:12px;font-weight:500;margin-bottom:2px}
+.toast-sub{font-size:10px;color:var(--text-1);font-family:var(--font-m)}
+.toast-x{background:none;border:none;color:var(--text-2);cursor:pointer;font-size:14px;line-height:1;flex-shrink:0;margin-left:auto}
+
+/* ── MISC ── */
+.eyebrow{font-family:var(--font-m);font-size:11px;letter-spacing:2px;color:var(--cyan);text-transform:uppercase;margin-bottom:10px}
+.notice{background:var(--bg-2);border:1px solid var(--border);border-left:3px solid var(--cyan);border-radius:var(--r-md);padding:10px 14px;font-size:12px;color:var(--text-1);margin-bottom:18px}
+.notice.gold{border-left-color:var(--gold)}
+.notice.red{border-left-color:var(--red)}
+.addr-chip{display:inline-flex;align-items:center;gap:5px;font-family:var(--font-m);font-size:11px;color:var(--text-1);background:var(--bg-3);border:1px solid var(--border);border-radius:var(--r-sm);padding:3px 8px;cursor:pointer;transition:all .15s}
+.addr-chip:hover{border-color:var(--border-hi);color:var(--cyan)}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:var(--bg-0)}
+::-webkit-scrollbar-thumb{background:var(--bg-4);border-radius:3px}
+
+/* ── ANIMATIONS ── */
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+@keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes walletPulse{0%,100%{opacity:1}50%{opacity:.6}}
+@keyframes statFlash{0%{transform:scale(1.08)}100%{transform:scale(1)}}
+@keyframes shimmer{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
+@keyframes balanceFlash{0%{opacity:1}30%{opacity:.3}100%{opacity:1}}
+
+@media(max-width:900px){
+  .page-layout{grid-template-columns:1fr}
+  .sidebar{display:none}
+  .stats-row{grid-template-columns:1fr 1fr}
+  .plan-grid{grid-template-columns:1fr}
+}
+
+/* ── V2 additions ── */
+.badge-overdue{background:rgba(240,184,64,.12);color:var(--gold);border:1px solid rgba(240,184,64,.3)}
+.badge-overdue::before{background:var(--gold);animation:pulse 1s infinite}
+.badge-suspended{background:var(--red-dim);color:var(--red);border:1px solid rgba(240,80,96,.3)}
+.badge-suspended::before{background:var(--red)}
+
+.retry-bar{background:var(--bg-0);border:1px solid rgba(240,184,64,.3);border-radius:var(--r-md);padding:10px 14px;margin-bottom:14px;font-size:12px;color:var(--gold);display:flex;gap:10px;align-items:flex-start}
+.grace-bar{background:rgba(240,80,96,.06);border:1px solid rgba(240,80,96,.25);border-radius:var(--r-md);padding:10px 14px;margin-bottom:14px;font-size:12px;color:var(--red);display:flex;gap:10px;align-items:flex-start}
+
+.coupon-input-row{display:flex;gap:8px;margin-bottom:14px}
+.coupon-input-row input{flex:1}
+.coupon-ok{color:var(--green);font-size:11px;font-family:var(--font-m);margin-top:4px}
+.coupon-err{color:var(--red);font-size:11px;font-family:var(--font-m);margin-top:4px}
+
+.notif-dot{width:7px;height:7px;border-radius:50%;background:var(--red);flex-shrink:0;margin-top:4px}
+.notif-unread{background:var(--bg-2)}
+
+.usage-bar-wrap{background:var(--bg-3);border-radius:2px;height:5px;flex:1}
+.usage-bar-fill{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--cyan),var(--purple))}
+
+.plan-change-preview{background:var(--bg-2);border:1px solid var(--border);border-radius:var(--r-lg);padding:16px;margin-bottom:16px}
+.plan-compare-row{display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px}
+.plan-compare-row:last-child{border-bottom:none}
+
+.referral-link-box{background:var(--bg-0);border:1px solid var(--border-hi);border-radius:var(--r-md);padding:10px 14px;font-family:var(--font-m);font-size:11px;color:var(--cyan);cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:space-between}
+.referral-link-box:hover{border-color:var(--cyan);box-shadow:var(--glow-cyan)}
+
+.forecast-chart{display:flex;align-items:flex-end;gap:4px;height:80px;margin-top:10px}
+.forecast-bar{flex:1;border-radius:3px 3px 0 0;transition:opacity .15s;position:relative}
+.forecast-bar:hover{opacity:.75}
+.forecast-bar.projected{opacity:.45;background:repeating-linear-gradient(45deg,transparent,transparent 3px,rgba(255,255,255,.1) 3px,rgba(255,255,255,.1) 6px)}
+</style>
+</head>
+<body>
+<div id="app">
+
+<!-- ══════════════════════════════════════════════
+     NAV
+══════════════════════════════════════════════ -->
+<nav class="nav">
+  <div class="nav-logo" onclick="showPage('landing')">
+    <div class="nav-logo-icon">A</div>
+    Arc<span>Sub</span>
+  </div>
+
+  <div class="nav-links">
+    <button class="nav-link active" id="nl-landing"  onclick="showPage('landing')">Home</button>
+    <button class="nav-link"        id="nl-browse"   onclick="showPage('browse')">Browse</button>
+    <button class="nav-link"        id="nl-merchant" onclick="showPage('merchant')">Merchant</button>
+    <button class="nav-link"        id="nl-dashboard" onclick="showPage('dashboard')">Dashboard</button>
+  </div>
+
+  <!-- UTC clock -->
+  <div class="utc-clock" id="utc-clock">…</div>
+
+  <!-- Chain tag -->
+  <div class="chain-tag">ARC·5042002</div>
+
+  <!-- Wallet area -->
+  <div id="wallet-area">
+    <button class="wallet-btn-connect" onclick="openWalletModal()">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 12V22H4V12"/><path d="M22 7H2v5h20V7z"/><path d="M12 22V7"/><path d="M12 7H7.5a2.5 2.5 0 0 1 0-5C11 2 12 7 12 7z"/><path d="M12 7h4.5a2.5 2.5 0 0 0 0-5C13 2 12 7 12 7z"/></svg>
+      Connect Wallet
+    </button>
+  </div>
+</nav>
+
+<!-- ══════════════════════════════════════════════
+     WALLET PICKER MODAL
+══════════════════════════════════════════════ -->
+<div id="wallet-modal" style="display:none">
+  <div class="wallet-modal-overlay" onclick="if(event.target===this)closeWalletModal()">
+    <div class="wallet-modal">
+
+      <div style="padding:26px 28px 0;display:flex;align-items:flex-start;justify-content:space-between">
+        <div>
+          <div class="modal-title">Connect Wallet</div>
+          <div style="font-family:var(--font-m);font-size:11px;color:var(--text-2);margin-top:4px">Arc Testnet · Chain 5042002</div>
+        </div>
+        <button class="modal-close" onclick="closeWalletModal()">×</button>
+      </div>
+
+      <div style="padding:20px 28px 28px;display:flex;flex-direction:column;gap:12px">
+
+        <div class="notice">
+          Select your wallet. Each will open its own browser extension popup to request connection.
+        </div>
+
+        <!-- MetaMask option -->
+        <div class="wallet-option" id="mm-option" onclick="connectWallet('metamask')"
+          style="border-color:rgba(245,132,31,0)">
+          <div id="mm-shimmer" style="display:none;position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(245,132,31,.12),transparent);animation:shimmer 1.4s infinite;pointer-events:none"></div>
+          <div class="wallet-option-logo" style="background:rgba(245,132,31,.1);border:1px solid rgba(245,132,31,.25)">
+            <!-- MetaMask Fox SVG -->
+            <svg width="38" height="38" viewBox="0 0 318 318">
+              <polygon points="274.1,35.5 174.6,109.4 193,65.8" fill="#E2761B" stroke="#E2761B" stroke-linejoin="round"/>
+              <polygon points="43.8,35.5 142.5,110.1 124.9,65.8" fill="#E4761B" stroke="#E4761B" stroke-linejoin="round"/>
+              <polygon points="238.3,206.8 211.8,247.4 268.5,263 284.8,207.7" fill="#E4761B" stroke="#E4761B" stroke-linejoin="round"/>
+              <polygon points="33.3,207.7 49.5,263 106.2,247.4 79.7,206.8" fill="#E4761B" stroke="#E4761B" stroke-linejoin="round"/>
+              <polygon points="103.1,138.2 87.1,162.5 143.4,165 141.4,104.2" fill="#E4761B" stroke="#E4761B" stroke-linejoin="round"/>
+              <polygon points="214.7,138.2 176.3,103.5 174.6,165 230.8,162.5" fill="#E4761B" stroke="#E4761B" stroke-linejoin="round"/>
+              <polygon points="106.2,247.4 139.7,230.3 110.8,208.1" fill="#E4761B" stroke="#E4761B" stroke-linejoin="round"/>
+              <polygon points="178.1,230.3 211.8,247.4 207,208.1" fill="#E4761B" stroke="#E4761B" stroke-linejoin="round"/>
+              <polygon points="211.8,247.4 178.1,230.3 180.8,252.1 180.5,262.3" fill="#D7C1B3" stroke="#D7C1B3" stroke-linejoin="round"/>
+              <polygon points="106.2,247.4 137.4,262.3 137.2,252.1 139.7,230.3" fill="#D7C1B3" stroke="#D7C1B3" stroke-linejoin="round"/>
+              <polygon points="137.8,197 110.1,189 128.5,180.1" fill="#233447" stroke="#233447" stroke-linejoin="round"/>
+              <polygon points="180,197 189.7,180.1 208.2,189" fill="#233447" stroke="#233447" stroke-linejoin="round"/>
+              <polygon points="106.2,247.4 110.9,206.8 79.7,207.7" fill="#CC6228" stroke="#CC6228" stroke-linejoin="round"/>
+              <polygon points="207,206.8 211.8,247.4 238.3,207.7" fill="#CC6228" stroke="#CC6228" stroke-linejoin="round"/>
+              <polygon points="230.8,162.5 174.6,165 180.1,197 189.8,180.1 208.3,189" fill="#CC6228" stroke="#CC6228" stroke-linejoin="round"/>
+              <polygon points="110,189 128.5,180.1 137.8,197 143.4,165 87.1,162.5" fill="#CC6228" stroke="#CC6228" stroke-linejoin="round"/>
+              <polygon points="87.1,162.5 110.9,208.1 110,189" fill="#E27525" stroke="#E27525" stroke-linejoin="round"/>
+              <polygon points="208.3,189 207,208.1 230.8,162.5" fill="#E27525" stroke="#E27525" stroke-linejoin="round"/>
+              <polygon points="143.4,165 137.8,197 144.8,232.2 146.4,186.5" fill="#E27525" stroke="#E27525" stroke-linejoin="round"/>
+              <polygon points="174.6,165 171.5,186.4 173.1,232.2 180.1,197" fill="#E27525" stroke="#E27525" stroke-linejoin="round"/>
+              <polygon points="180.1,197 173.1,232.2 178.2,230.3 207,208.1 208.3,189" fill="#F5841F" stroke="#F5841F" stroke-linejoin="round"/>
+              <polygon points="110,189 110.9,208.1 139.7,230.3 144.8,232.2 137.8,197" fill="#F5841F" stroke="#F5841F" stroke-linejoin="round"/>
+              <polygon points="180.5,262.3 180.8,252.1 178.2,249.9 139.5,249.9 137.2,252.1 137.4,262.3 106.2,247.4 116.8,256.1 139.2,271.7 178.6,271.7 201.1,256.1 211.8,247.4" fill="#C0AD9E" stroke="#C0AD9E" stroke-linejoin="round"/>
+              <polygon points="178.1,230.3 173.1,232.2 144.8,232.2 139.7,230.3 137.2,252.1 139.5,249.9 178.2,249.9 180.8,252.1" fill="#161616" stroke="#161616" stroke-linejoin="round"/>
+              <polygon points="278.3,114 284.8,83 274.1,35.5 178.1,107 213.8,139.7 267.1,155.2 279.3,140.9 274.1,137.1 282.3,129.7 275.8,124.7 284,118.4" fill="#763D16" stroke="#763D16" stroke-linejoin="round"/>
+              <polygon points="33.1,83 39.6,114 33.7,118.4 42,124.7 35.5,129.7 43.7,137.1 38.5,140.9 50.6,155.2 103.9,139.7 139.6,107 43.7,35.5" fill="#763D16" stroke="#763D16" stroke-linejoin="round"/>
+              <polygon points="267.1,155.2 213.8,139.7 230.8,162.5 207,208.1 238.3,207.7 284.8,207.7" fill="#F5841F" stroke="#F5841F" stroke-linejoin="round"/>
+              <polygon points="103.9,139.7 50.6,155.2 33.3,207.7 79.7,207.7 110.9,208.1 87.1,162.5" fill="#F5841F" stroke="#F5841F" stroke-linejoin="round"/>
+              <polygon points="174.6,165 178.1,107 193.3,65.8 124.9,65.8 139.6,107 143.4,165 144.7,186.6 144.8,232.2 173,232.2 173.2,186.6" fill="#F5841F" stroke="#F5841F" stroke-linejoin="round"/>
+            </svg>
+          </div>
+          <div style="flex:1">
+            <div style="font-family:var(--font-d);font-weight:600;font-size:16px;margin-bottom:4px;display:flex;align-items:center;gap:8px">
+              MetaMask
+              <span id="mm-badge" class="wallet-badge" style="display:none"></span>
+            </div>
+            <div id="mm-desc" style="font-size:12px;color:var(--text-2);font-family:var(--font-m)">Connect using MetaMask browser extension</div>
+          </div>
+          <div id="mm-arrow" style="font-family:var(--font-m);font-size:16px;color:var(--text-3)">→</div>
+        </div>
+
+        <!-- OKX option -->
+        <div class="wallet-option" id="okx-option" onclick="connectWallet('okx')"
+          style="border-color:rgba(255,255,255,0)">
+          <div id="okx-shimmer" style="display:none;position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.07),transparent);animation:shimmer 1.4s infinite;pointer-events:none"></div>
+          <div class="wallet-option-logo" style="background:#0a0a0a;border:1px solid rgba(255,255,255,.12)">
+            <svg width="36" height="36" viewBox="0 0 32 32">
+              <rect width="32" height="32" rx="7" fill="#000"/>
+              <rect x="5.5" y="5.5" width="9" height="9" rx="1.5" fill="white"/>
+              <rect x="17.5" y="5.5" width="9" height="9" rx="1.5" fill="white"/>
+              <rect x="5.5" y="17.5" width="9" height="9" rx="1.5" fill="white"/>
+              <rect x="17.5" y="17.5" width="9" height="9" rx="1.5" fill="white"/>
+            </svg>
+          </div>
+          <div style="flex:1">
+            <div style="font-family:var(--font-d);font-weight:600;font-size:16px;margin-bottom:4px;display:flex;align-items:center;gap:8px">
+              OKX Wallet
+              <span id="okx-badge" class="wallet-badge" style="display:none"></span>
+            </div>
+            <div id="okx-desc" style="font-size:12px;color:var(--text-2);font-family:var(--font-m)">Connect using OKX Wallet browser extension</div>
+          </div>
+          <div id="okx-arrow" style="font-family:var(--font-m);font-size:16px;color:var(--text-3)">→</div>
+        </div>
+
+        <!-- Error -->
+        <div id="wallet-error" style="display:none;background:var(--red-dim);border:1px solid rgba(240,80,96,.25);border-radius:var(--r-md);padding:10px 14px;font-size:12px;color:var(--red);font-family:var(--font-m)"></div>
+
+        <!-- Add Arc guide -->
+        <div style="padding-top:16px;border-top:1px solid var(--border);font-family:var(--font-m);font-size:11px;color:var(--text-2);line-height:1.8">
+          <div style="color:var(--text-1);margin-bottom:6px">Add Arc Testnet manually if needed:</div>
+          <div><span style="color:var(--text-3);width:64px;display:inline-block">RPC URL:</span> <span style="color:var(--cyan)">https://rpc.testnet.arc.network</span></div>
+          <div><span style="color:var(--text-3);width:64px;display:inline-block">Chain ID:</span> <span style="color:var(--cyan)">5042002</span></div>
+          <div><span style="color:var(--text-3);width:64px;display:inline-block">Currency:</span> <span style="color:var(--cyan)">USDC</span></div>
+          <div><span style="color:var(--text-3);width:64px;display:inline-block">Explorer:</span> <span style="color:var(--cyan)">testnet.arcscan.app</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     LANDING
+══════════════════════════════════════════════ -->
+<div class="page active" id="page-landing">
+  <section class="hero">
+    <div class="hero-grid"></div>
+    <div class="hero-badge"><span class="hero-dot"></span>LIVE ON ARC TESTNET</div>
+    <h1 class="hero-title">
+      Recurring payments<br>
+      <span class="grad">for the onchain economy</span>
+    </h1>
+    <p class="hero-sub">Create and manage stablecoin subscriptions on Arc — the fastest, cheapest L1 built for real-world finance. No intermediaries, no volatility.</p>
+    <div class="hero-ctas">
+      <button class="btn-primary" onclick="showPage('browse')">Explore Plans</button>
+      <button class="btn-secondary" onclick="showPage('merchant')">Launch as Merchant</button>
+    </div>
+    <div class="hero-stats">
+      <div class="hero-stat"><span class="hero-stat-val">$0.01</span><span class="hero-stat-lbl">Avg tx cost</span></div>
+      <div class="hero-stat-div"></div>
+      <div class="hero-stat"><span class="hero-stat-val">&lt;1s</span><span class="hero-stat-lbl">Finality</span></div>
+      <div class="hero-stat-div"></div>
+      <div class="hero-stat"><span class="hero-stat-val">USDC</span><span class="hero-stat-lbl">Native gas</span></div>
+      <div class="hero-stat-div"></div>
+      <div class="hero-stat"><span class="hero-stat-val">EVM</span><span class="hero-stat-lbl">Compatible</span></div>
+    </div>
+  </section>
+
+  <section style="padding:80px 32px;max-width:1100px;margin:0 auto">
+    <div class="eyebrow">// CAPABILITIES</div>
+    <h2 style="font-family:var(--font-d);font-weight:700;font-size:34px;letter-spacing:-1px;margin-bottom:40px;max-width:440px">Built different,<br>for builders.</h2>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--border);border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden">
+      <div class="feat-card" style="background:var(--bg-1);padding:28px;transition:background .2s" onmouseenter="this.style.background='var(--bg-2)'" onmouseleave="this.style.background='var(--bg-1)'">
+        <div style="width:42px;height:42px;border-radius:var(--r-md);background:var(--cyan-dim);display:flex;align-items:center;justify-content:center;font-size:18px;margin-bottom:16px">⚡</div>
+        <div style="font-family:var(--font-d);font-weight:600;font-size:15px;margin-bottom:7px">Sub-second Finality</div>
+        <p style="font-size:12px;color:var(--text-1);line-height:1.65">Payments settle deterministically in under one second. No reorgs. No waiting.</p>
+      </div>
+      <div class="feat-card" style="background:var(--bg-1);padding:28px;transition:background .2s" onmouseenter="this.style.background='var(--bg-2)'" onmouseleave="this.style.background='var(--bg-1)'">
+        <div style="width:42px;height:42px;border-radius:var(--r-md);background:var(--gold-dim);display:flex;align-items:center;justify-content:center;font-size:18px;margin-bottom:16px">💵</div>
+        <div style="font-family:var(--font-d);font-weight:600;font-size:15px;margin-bottom:7px">Dollar-denominated Fees</div>
+        <p style="font-size:12px;color:var(--text-1);line-height:1.65">Gas paid in USDC — predictable costs, zero volatility exposure.</p>
+      </div>
+      <div class="feat-card" style="background:var(--bg-1);padding:28px;transition:background .2s" onmouseenter="this.style.background='var(--bg-2)'" onmouseleave="this.style.background='var(--bg-1)'">
+        <div style="width:42px;height:42px;border-radius:var(--r-md);background:var(--green-dim);display:flex;align-items:center;justify-content:center;font-size:18px;margin-bottom:16px">🔄</div>
+        <div style="font-family:var(--font-d);font-weight:600;font-size:15px;margin-bottom:7px">Flexible Billing Cycles</div>
+        <p style="font-size:12px;color:var(--text-1);line-height:1.65">Weekly, monthly, or annual. Trial periods. Caps. Revenue splits.</p>
+      </div>
+      <div class="feat-card" style="background:var(--bg-1);padding:28px;transition:background .2s" onmouseenter="this.style.background='var(--bg-2)'" onmouseleave="this.style.background='var(--bg-1)'">
+        <div style="width:42px;height:42px;border-radius:var(--r-md);background:var(--cyan-dim);display:flex;align-items:center;justify-content:center;font-size:18px;margin-bottom:16px">🛡️</div>
+        <div style="font-family:var(--font-d);font-weight:600;font-size:15px;margin-bottom:7px">Battle-tested Security</div>
+        <p style="font-size:12px;color:var(--text-1);line-height:1.65">ReentrancyGuard, Pausable, Ownable. Auto-cancel after 3 failures.</p>
+      </div>
+      <div class="feat-card" style="background:var(--bg-1);padding:28px;transition:background .2s" onmouseenter="this.style.background='var(--bg-2)'" onmouseleave="this.style.background='var(--bg-1)'">
+        <div style="width:42px;height:42px;border-radius:var(--r-md);background:var(--gold-dim);display:flex;align-items:center;justify-content:center;font-size:18px;margin-bottom:16px">🔗</div>
+        <div style="font-family:var(--font-d);font-weight:600;font-size:15px;margin-bottom:7px">Circle Stack Native</div>
+        <p style="font-size:12px;color:var(--text-1);line-height:1.65">USDC &amp; EURC on Arc. CCTP bridges from 10+ chains. Gateway included.</p>
+      </div>
+      <div class="feat-card" style="background:var(--bg-1);padding:28px;transition:background .2s" onmouseenter="this.style.background='var(--bg-2)'" onmouseleave="this.style.background='var(--bg-1)'">
+        <div style="width:42px;height:42px;border-radius:var(--r-md);background:var(--green-dim);display:flex;align-items:center;justify-content:center;font-size:18px;margin-bottom:16px">📊</div>
+        <div style="font-family:var(--font-d);font-weight:600;font-size:15px;margin-bottom:7px">Real-time Analytics</div>
+        <p style="font-size:12px;color:var(--text-1);line-height:1.65">MRR, churn, growth — pulled directly from onchain events.</p>
+      </div>
+    </div>
+  </section>
+
+  <section style="padding:60px 32px;text-align:center;border-top:1px solid var(--border)">
+    <h2 style="font-family:var(--font-d);font-size:34px;font-weight:800;letter-spacing:-1px;margin-bottom:14px">Start building today.</h2>
+    <p style="color:var(--text-1);font-size:14px;margin-bottom:28px">Arc Testnet is live. Get free USDC from the faucet and deploy in minutes.</p>
+    <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
+      <button class="btn-primary" style="font-size:15px;padding:12px 28px" onclick="showPage('browse')">Launch App</button>
+      <button class="btn-secondary" style="font-size:15px;padding:12px 28px" onclick="window.open('https://faucet.circle.com','_blank')">Get Testnet USDC ↗</button>
+    </div>
+    <p style="margin-top:20px;font-family:var(--font-m);font-size:11px;color:var(--text-3)">Arc Testnet · Chain ID 5042002 · USDC: 0x3600…0000</p>
+  </section>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     BROWSE
+══════════════════════════════════════════════ -->
+<div class="page" id="page-browse">
+  <div style="padding:32px;max-width:1200px;margin:0 auto">
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:24px;gap:16px;flex-wrap:wrap">
+      <div>
+        <h1 style="font-family:var(--font-d);font-weight:700;font-size:26px;letter-spacing:-.5px;margin-bottom:4px">Explore Plans</h1>
+        <p style="font-size:13px;color:var(--text-1)">Subscribe to services using USDC on Arc</p>
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <select class="input" id="filter-interval" onchange="renderPlans()" style="width:auto;padding:8px 12px">
+          <option value="">All intervals</option>
+          <option value="Weekly">Weekly</option>
+          <option value="Monthly">Monthly</option>
+          <option value="Annually">Annually</option>
+        </select>
+        <select class="input" id="filter-token" onchange="renderPlans()" style="width:auto;padding:8px 12px">
+          <option value="">All tokens</option>
+          <option value="USDC">USDC</option>
+          <option value="EURC">EURC</option>
+        </select>
+      </div>
+    </div>
+    <div style="position:relative;margin-bottom:24px">
+      <span style="position:absolute;left:14px;top:50%;transform:translateY(-50%);color:var(--text-2);pointer-events:none">🔍</span>
+      <input class="input" id="search-plans" placeholder="Search plans by name…" oninput="renderPlans()" style="padding-left:42px">
+    </div>
+    <div class="plan-grid" id="plan-grid"></div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     MERCHANT
+══════════════════════════════════════════════ -->
+<div class="page" id="page-merchant">
+  <div class="page-layout">
+    <aside class="sidebar">
+      <div style="padding:0 8px;flex:1">
+        <div class="sidebar-label" style="margin-bottom:6px">MERCHANT</div>
+        <div class="sidebar-item active" id="ms-overview"     onclick="merchantTab('overview',this)">⊞ Overview</div>
+        <div class="sidebar-item"        id="ms-plans"        onclick="merchantTab('plans',this)">📄 Plans <span class="sidebar-badge">4</span></div>
+        <div class="sidebar-item"        id="ms-subscribers"  onclick="merchantTab('subscribers',this)">👥 Subscribers <span class="sidebar-badge">24</span></div>
+        <div class="sidebar-item"        id="ms-revenue"      onclick="merchantTab('revenue',this)">📈 Revenue</div>
+        <div class="sidebar-item"        id="ms-settings"     onclick="merchantTab('settings',this)">⚙️ Settings</div>
+        <div class="sidebar-item"         id="ms-coupons"   onclick="merchantTab('coupons',this)">🎟️ Coupons</div>
+        <div class="sidebar-item"         id="ms-referrals" onclick="merchantTab('referrals',this)">🎯 Referrals</div>
+        <div class="sidebar-item"         id="ms-payouts"   onclick="merchantTab('payouts',this)">💰 Payouts</div>
+        <div class="sidebar-item" style="margin-top:8px" onclick="openCreatePlan()">＋ Create Plan</div>
+      </div>
+      <div style="padding:12px;border-top:1px solid var(--border)">
+        <div style="background:var(--bg-2);border:1px solid var(--border);border-radius:var(--r-md);padding:12px">
+          <div style="font-family:var(--font-m);font-size:9px;color:var(--text-3);letter-spacing:1px;margin-bottom:6px">YOUR WALLET</div>
+          <div class="addr-chip" id="sidebar-addr" style="font-size:10px;width:100%;justify-content:center">Not connected</div>
+          <div style="margin-top:8px;font-family:var(--font-m);font-size:11px;color:var(--text-1)">Balance: <span id="sidebar-balance" style="color:var(--cyan)">—</span></div>
+        </div>
+      </div>
+    </aside>
+    <main class="page-content">
+      <div id="m-overview"></div>
+      <div id="m-plans"       style="display:none"></div>
+      <div id="m-subscribers" style="display:none"></div>
+      <div id="m-revenue"     style="display:none"></div>
+      <div id="m-coupons"     style="display:none"></div>
+      <div id="m-referrals"   style="display:none"></div>
+      <div id="m-payouts"     style="display:none"></div>
+      <div id="m-settings"    style="display:none"></div>
+    </main>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     DASHBOARD
+══════════════════════════════════════════════ -->
+<div class="page" id="page-dashboard">
+  <div class="page-layout">
+    <aside class="sidebar">
+      <div style="padding:0 8px;flex:1">
+        <div class="sidebar-label" style="margin-bottom:6px">MY ACCOUNT</div>
+        <div class="sidebar-item active" id="ds-subs"     onclick="dashTab('subs',this)">📦 My Subscriptions <span class="sidebar-badge">4</span></div>
+        <div class="sidebar-item"         id="ds-history"  onclick="dashTab('history',this)">🕐 Payment History</div>
+        <div class="sidebar-item"         id="ds-usage"    onclick="dashTab('usage',this)">📊 Usage Details</div>
+        <div class="sidebar-item"         id="ds-notif"    onclick="dashTab('notif',this)">🔔 Notifications <span class="sidebar-badge" id="notif-badge" style="background:var(--red-dim);color:var(--red)">2</span></div>
+        <div class="sidebar-item"         id="ds-wallet"   onclick="dashTab('wallet',this)">🔐 Wallet Settings</div>
+        <div class="sidebar-item"         id="ds-referral" onclick="dashTab('referral',this)">🎯 Referrals</div>
+        <div class="sidebar-item" onclick="showPage('browse')">🔍 Explore Plans</div>
+      </div>
+      <div style="padding:12px;border-top:1px solid var(--border)">
+        <div style="background:var(--bg-2);border:1px solid var(--border);border-radius:var(--r-md);padding:12px">
+          <div style="font-family:var(--font-m);font-size:9px;color:var(--text-3);letter-spacing:1px;margin-bottom:6px">CONNECTED</div>
+          <div class="addr-chip" id="user-sidebar-addr" style="font-size:10px;width:100%;justify-content:center">Not connected</div>
+          <div style="margin-top:8px;font-family:var(--font-m);font-size:11px;color:var(--text-1)">Balance: <span id="user-sidebar-balance" style="color:var(--green)">—</span></div>
+        </div>
+      </div>
+    </aside>
+    <main class="page-content">
+      <div id="d-subs"></div>
+      <div id="d-history"  style="display:none"></div>
+      <div id="d-usage"    style="display:none"></div>
+      <div id="d-notif"    style="display:none"></div>
+      <div id="d-wallet"   style="display:none"></div>
+      <div id="d-referral" style="display:none"></div>
+    </main>
+  </div>
+</div>
+
+<!-- Subscribe modal -->
+<div id="modal-subscribe" style="display:none">
+  <div class="modal-overlay" onclick="if(event.target===this)closeModal('modal-subscribe')">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title">Subscribe</div>
+        <button class="modal-close" onclick="closeModal('modal-subscribe')">×</button>
+      </div>
+      <div class="modal-body" id="sub-modal-body"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Create plan modal -->
+<div id="modal-create" style="display:none">
+  <div class="modal-overlay" onclick="if(event.target===this)closeModal('modal-create')">
+    <div class="modal" style="max-width:580px">
+      <div class="modal-header">
+        <div><div class="modal-title">Create Plan</div><div style="font-family:var(--font-m);font-size:11px;color:var(--text-2);margin-top:3px">Calls createPlan() on Arc Testnet</div></div>
+        <button class="modal-close" onclick="closeModal('modal-create')">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="notice">Get testnet USDC at <a href="https://faucet.circle.com" target="_blank" style="color:var(--cyan);text-decoration:none;font-weight:600">faucet.circle.com ↗</a> before deploying.</div>
+        <div class="form-grid" style="margin-bottom:16px">
+          <div class="form-group span-2"><label class="field-label">Plan Name *</label><input class="input" id="cp-name" placeholder="e.g. Premium Newsletter"></div>
+          <div class="form-group span-2"><label class="field-label">Description</label><textarea class="input" id="cp-desc" placeholder="What subscribers get…"></textarea></div>
+          <div class="form-group">
+            <label class="field-label">Price *</label>
+            <div class="input-wrap"><input class="input" type="number" id="cp-price" placeholder="10" min="0.01" step="0.01" style="padding-right:60px" oninput="updateIntervalPreviews()"><span class="input-suffix" id="cp-token-suffix">USDC</span></div>
+          </div>
+          <div class="form-group">
+            <label class="field-label">Trial Days</label>
+            <div class="input-wrap"><input class="input" type="number" id="cp-trial" placeholder="0" min="0" style="padding-right:50px"><span class="input-suffix">days</span></div>
+          </div>
+          <div class="form-group">
+            <label class="field-label">Max Subscribers (0 = unlimited)</label>
+            <input class="input" type="number" id="cp-max" placeholder="0" min="0">
+          </div>
+        </div>
+        <label class="field-label" style="display:block;margin-bottom:8px">Billing Interval</label>
+        <div class="interval-toggle" style="margin-bottom:18px">
+          <div class="interval-opt selected" id="iv-Weekly"    onclick="selectInterval('Weekly',this)">Weekly<div id="prev-Weekly" style="font-family:var(--font-m);font-size:10px;opacity:.6;margin-top:2px">—</div></div>
+          <div class="interval-opt"          id="iv-Monthly"   onclick="selectInterval('Monthly',this)">Monthly<div id="prev-Monthly" style="font-family:var(--font-m);font-size:10px;opacity:.6;margin-top:2px">—</div></div>
+          <div class="interval-opt"          id="iv-Annually"  onclick="selectInterval('Annually',this)">Annually<div id="prev-Annually" style="font-family:var(--font-m);font-size:10px;opacity:.6;margin-top:2px">—</div></div>
+        </div>
+        <label class="field-label" style="display:block;margin-bottom:8px">Accepted Token</label>
+        <div class="token-row" style="margin-bottom:24px">
+          <div class="token-opt selected" id="tok-USDC" onclick="selectToken('USDC',this)"><div class="token-icon" style="background:#2775ca">$</div>USDC</div>
+          <div class="token-opt"          id="tok-EURC" onclick="selectToken('EURC',this)"><div class="token-icon" style="background:#1da8a8">€</div>EURC</div>
+        </div>
+        <div id="cp-error" style="display:none;background:var(--red-dim);border:1px solid rgba(240,80,96,.25);border-radius:var(--r-md);padding:10px 14px;font-size:12px;color:var(--red);font-family:var(--font-m);margin-bottom:14px"></div>
+        <div style="display:flex;gap:10px;justify-content:flex-end;padding-top:16px;border-top:1px solid var(--border)">
+          <button class="btn-ghost" onclick="closeModal('modal-create')">Cancel</button>
+          <button class="btn-primary" id="cp-btn" onclick="submitCreatePlan()">Deploy Plan →</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Charge modal -->
+<div id="modal-charge" style="display:none">
+  <div class="modal-overlay" onclick="if(event.target===this)closeModal('modal-charge')">
+    <div class="modal" style="max-width:440px">
+      <div class="modal-header">
+        <div class="modal-title">Confirm Payment</div>
+        <button class="modal-close" onclick="closeModal('modal-charge')">×</button>
+      </div>
+      <div class="modal-body" id="charge-modal-body"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Toasts -->
+<div class="toast-wrap" id="toast-wrap"></div>
+
+</div><!-- /app -->
+
+<script>
+// ══════════════════════════════════════════════
+// STATE
+// ══════════════════════════════════════════════
+const STATE = {
+  connected:   false,
+  wallet:      '',
+  address:     '',
+  balance:     null,
+  activePlan:  null,
+  activeSub:   null,
+  createInterval: 'Weekly',
+  createToken:    'USDC',
+  // V2
+  backupWallet:   '',
+  couponCode:     '',
+  couponValid:    null,
+  changePlanSub:  null,
+}
+
+// Demo plans
+const PLANS = [
+  // Sorted lowest → highest price (Basic → Advanced)
+  {id:3,name:'Membership Pass',desc:'Join our exclusive creator community. Access gated content, weekly AMAs, and Discord perks.',price:5,interval:'Weekly',token:'USDC',trial:0,max:1000,subs:289,color:'#3cf0a0',merchant:'0xC3D4E5F6A7b8C9d0E1f2A3B4C5d6E7F8a9B0C1d2'},
+  {id:1,name:'Premium Newsletter',desc:'Weekly deep-dives into DeFi, AI, and macro finance. Curated by ex-Goldman analysts.',price:10,interval:'Monthly',token:'USDC',trial:0,max:500,subs:142,color:'#38c8f0',merchant:'0xA1b2C3D4e5F6A7B8C9D0e1F2A3b4C5D6e7F8A9b0'},
+  {id:5,name:'Yield Signals',desc:'Real-time USDC yield opportunities across DeFi. Automated alerts, backtested strategies.',price:15,interval:'Monthly',token:'EURC',trial:0,max:0,subs:91,color:'#f05060',merchant:'0xE5F6A7B8C9D0e1F2a3B4c5D6E7f8A9b0C1D2e3f4'},
+  {id:2,name:'SaaS Builder Pro',desc:'Full access to our analytics platform, API integrations, and 24/7 support.',price:25,interval:'Monthly',token:'USDC',trial:7,max:0,subs:67,color:'#f0b840',merchant:'0xB2C3D4E5f6A7B8c9D0E1F2a3B4c5D6E7f8A9B0c1'},
+  {id:6,name:'Web3 Bootcamp',desc:'8-week structured course on building DeFi apps on Arc.',price:149,interval:'Annually',token:'USDC',trial:3,max:50,subs:44,color:'#38c8f0',merchant:'0xF6A7B8C9D0E1f2A3b4C5d6E7F8a9B0c1D2E3f4a5'},
+  {id:4,name:'Research Vault',desc:'Annual subscription to institutional-grade onchain research.',price:199,interval:'Annually',token:'USDC',trial:14,max:200,subs:38,color:'#9b7ff0',merchant:'0xD4E5F6A7B8C9d0E1F2A3b4C5D6e7F8A9B0C1d2e3'},
+]
+
+// Demo subscriptions
+const USER_SUBS = [
+  {id:101,planId:1,planName:'Premium Newsletter',merchant:'AlphaMedia',price:10,token:'USDC',interval:'Monthly',start:'Mar 1, 2026',next:'May 1, 2026',payments:2,status:'active', retryCount:0, gracePeriodEnd:null, usageThisMonth:0},
+  {id:102,planId:2,planName:'SaaS Builder Pro',merchant:'DevTools Inc',price:25,token:'USDC',interval:'Monthly',start:'Mar 15, 2026',next:'Apr 15, 2026',payments:1,status:'paused', retryCount:1, nextRetryAt:'Apr 28, 2026 06:00', gracePeriodEnd:null, usageThisMonth:0},
+  {id:103,planId:3,planName:'Membership Pass',merchant:'CreatorDAO',price:5,token:'USDC',interval:'Weekly',start:'Apr 6, 2026',next:'Apr 27, 2026',payments:2,status:'overdue', retryCount:2, nextRetryAt:'Apr 28, 2026 14:00', gracePeriodEnd:'May 1, 2026', usageThisMonth:0},
+  {id:104,planId:2,planName:'SaaS Builder Pro',merchant:'DevTools Inc',price:25,token:'USDC',interval:'Monthly',start:'Feb 1, 2026',next:'May 1, 2026',payments:3,status:'active', retryCount:0, gracePeriodEnd:null, usageThisMonth:142, usagePricePerUnit:0.01},
+]
+
+// V2 — Coupons
+const DEMO_COUPONS = [
+  {code:'WELCOME20', discount:20, type:'percent', planId:null, uses:47, maxUses:100, expires:'Jun 30, 2026'},
+  {code:'FREE7DAYS', trialExt:7,  type:'trial',   planId:2,   uses:12, maxUses:50,  expires:'May 31, 2026'},
+  {code:'FLAT5OFF',  discount:5,  type:'fixed',   planId:null, uses:8, maxUses:200, expires:null},
+]
+
+// V2 — Referral data
+const DEMO_REFERRALS = [
+  {wallet:'0x1a2b…3c4d', plan:'SaaS Builder Pro', earned:2.5, date:'Apr 10, 2026', tx:'0xabc…'},
+  {wallet:'0x2b3c…4d5e', plan:'Membership Pass',  earned:0.5, date:'Apr 8, 2026',  tx:'0xdef…'},
+  {wallet:'0x3c4d…5e6f', plan:'Premium Newsletter',earned:1.0, date:'Apr 5, 2026',  tx:'0xghi…'},
+]
+
+// V2 — Usage records
+const DEMO_USAGE = [
+  {sub:'SaaS Builder Pro',type:'API Calls',    units:14200, price:0.01,   total:142,   period:'Apr 2026'},
+  {sub:'SaaS Builder Pro',type:'Storage GB',   units:8,     price:0.50,   total:4.00,  period:'Apr 2026'},
+  {sub:'Research Vault',  type:'Seats',        units:3,     price:5.00,   total:15.00, period:'Apr 2026'},
+]
+
+// V2 — Notifications
+const DEMO_NOTIFICATIONS = [
+  {type:'retry_scheduled', msg:'Payment retry #1 scheduled for SaaS Builder Pro.', date:'Apr 27, 2026', read:false},
+  {type:'grace_period',    msg:'Membership Pass payment overdue — 3-day grace period active.', date:'Apr 26, 2026', read:false},
+  {type:'payment_success', msg:'Premium Newsletter payment confirmed. Next billing: May 1, 2026.', date:'Apr 1, 2026', read:true},
+  {type:'trial_ending',    msg:'Your SaaS Builder Pro trial ends in 2 days.', date:'Mar 8, 2026', read:true},
+]
+
+const PAYMENT_HISTORY = [
+  {plan:'Membership Pass',   merchant:'CreatorDAO',  amount:5,  date:'Apr 13, 2026',status:'success',tx:'0x7a3f…c21b'},
+  {plan:'Premium Newsletter',merchant:'AlphaMedia',  amount:10, date:'Apr 1, 2026', status:'success',tx:'0x2b1e…a09c'},
+  {plan:'SaaS Builder Pro',  merchant:'DevTools Inc',amount:25, date:'Apr 1, 2026', status:'failed', tx:'—'},
+  {plan:'Membership Pass',   merchant:'CreatorDAO',  amount:5,  date:'Apr 6, 2026', status:'success',tx:'0x9c2d…f33e'},
+  {plan:'SaaS Builder Pro',  merchant:'DevTools Inc',amount:25, date:'Mar 15, 2026',status:'success',tx:'0x4e8a…b712'},
+  {plan:'Premium Newsletter',merchant:'AlphaMedia',  amount:10, date:'Mar 1, 2026', status:'success',tx:'0x1f5b…d490'},
+]
+
+const REVENUE_DATA = [
+  {m:'Oct',v:320},{m:'Nov',v:410},{m:'Dec',v:390},
+  {m:'Jan',v:540},{m:'Feb',v:620},{m:'Mar',v:755},{m:'Apr',v:847},
+]
+
+// ══════════════════════════════════════════════
+// ══════════════════════════════════════════════
+// EIP-6963 MULTI-WALLET PROVIDER REGISTRY
+// Each extension announces itself with its own
+// UUID — no window.ethereum conflicts.
+// ══════════════════════════════════════════════
+const PROVIDERS = {}
+const RDNS_MM  = 'io.metamask'
+const RDNS_OKX = 'com.okex.wallet'
+
+window.addEventListener('eip6963:announceProvider', (event) => {
+  const { info, provider } = event.detail
+  PROVIDERS[info.rdns] = provider
+  if (info.rdns.includes('metamask') || (provider.isMetaMask && !provider.isOkxWallet)) {
+    if (!PROVIDERS[RDNS_MM]) PROVIDERS[RDNS_MM] = provider
+  }
+  if (info.rdns.includes('okx') || info.rdns.includes('okex') || provider.isOkxWallet) {
+    if (!PROVIDERS[RDNS_OKX]) PROVIDERS[RDNS_OKX] = provider
+  }
+  updateDetectionBadges()
 })
+window.dispatchEvent(new Event('eip6963:requestProvider'))
 
-// ─────────────────────────────────────────────────────────────
-//  Database pool
-// ─────────────────────────────────────────────────────────────
-const db = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  max: 20,
-})
+// Resolve the correct isolated provider for each wallet type
+function resolveProvider(type) {
+  if (type === 'okx') {
+    return PROVIDERS[RDNS_OKX]
+        || window.okxwallet
+        || (window.ethereum && window.ethereum.isOkxWallet ? window.ethereum : null)
+  }
+  if (type === 'metamask') {
+    if (PROVIDERS[RDNS_MM]) return PROVIDERS[RDNS_MM]
+    if (window.ethereum && window.ethereum.providers) {
+      const mm = window.ethereum.providers.find(
+        p => p.isMetaMask && !p.isOkxWallet && !p.isCoinbaseWallet
+      )
+      if (mm) return mm
+    }
+    if (window.ethereum && window.ethereum.isMetaMask && !window.ethereum.isOkxWallet) {
+      return window.ethereum
+    }
+    return null
+  }
+  return null
+}
 
-// ─────────────────────────────────────────────────────────────
-//  Express app
-// ─────────────────────────────────────────────────────────────
-const app = express()
-app.use(express.json())
+function updateDetectionBadges() {
+  const hasMM  = !!(resolveProvider('metamask'))
+  const hasOKX = !!(resolveProvider('okx'))
+  ;[['mm-badge','mm-option',hasMM],['okx-badge','okx-option',hasOKX]].forEach(([bid,oid,det]) => {
+    const b = document.getElementById(bid)
+    const o = document.getElementById(oid)
+    if (!b) return
+    b.textContent   = det ? 'DETECTED' : 'INSTALL'
+    b.className     = det ? 'wallet-badge detected' : 'wallet-badge install'
+    b.style.display = ''
+    if (o) o.style.opacity = det ? '1' : '0.55'
+  })
+}
+updateDetectionBadges()
+setTimeout(updateDetectionBadges, 800)
+function tickClock() {
+  const now  = new Date()
+  const d    = now.toISOString().slice(0,10)
+  const t    = now.toISOString().slice(11,19)
+  document.getElementById('utc-clock').textContent = `${d} ${t} UTC`
+}
+tickClock()
+setInterval(tickClock, 1000)
 
-// ═════════════════════════════════════════════════════════════
-//  BILLING ENGINE
-// ═════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════
+// WALLET MODAL
+// ══════════════════════════════════════════════
+function openWalletModal() {
+  document.getElementById('wallet-modal').style.display = ''
+  document.getElementById('wallet-error').style.display = 'none'
+  resetWalletOptions()
+}
 
-// ── 1. Process due payments ───────────────────────────────────
-async function processDuePayments() {
-  const { rows } = await db.query(
-    `SELECT s.*, p.name AS plan_name, p.grace_period_sec
-     FROM subscriptions s
-     JOIN plans p ON s.plan_id = p.id
-     WHERE s.status IN ('active','overdue')
-       AND s.next_payment <= NOW()
-       AND s.retry_count = 0`
-  )
+function closeWalletModal() {
+  document.getElementById('wallet-modal').style.display = 'none'
+  resetWalletOptions()
+}
 
-  for (const sub of rows) {
+function resetWalletOptions() {
+  ['mm','okx'].forEach(id => {
+    const opt = document.getElementById(`${id}-option`)
+    if (!opt) return
+    opt.style.borderColor = 'var(--border)'
+    opt.style.background  = 'var(--bg-2)'
+    opt.style.transform   = ''
+    document.getElementById(`${id}-shimmer`).style.display = 'none'
+    document.getElementById(`${id}-arrow`).style.display   = ''
+  })
+  const mmDesc  = document.getElementById('mm-desc')
+  const okxDesc = document.getElementById('okx-desc')
+  if(mmDesc)  mmDesc.textContent  = 'Connect using MetaMask browser extension'
+  if(okxDesc) okxDesc.textContent = 'Connect using OKX Wallet browser extension'
+}
+
+async function connectWallet(type) {
+  const id    = type === 'metamask' ? 'mm' : 'okx'
+  const color = type === 'metamask' ? '#F5841F' : '#ffffff'
+  const name  = type === 'metamask' ? 'MetaMask' : 'OKX Wallet'
+  const CHROME_MM  = 'https://chromewebstore.google.com/detail/metamask/nkbihfbeogaeaoehlefnkodbefgpgknn'
+  const CHROME_OKX = 'https://chromewebstore.google.com/detail/okx-wallet/mcohilncbfahbmgdjkbpemcciiolgcge'
+
+  const opt     = document.getElementById(`${id}-option`)
+  const shimmer = document.getElementById(`${id}-shimmer`)
+  const arrow   = document.getElementById(`${id}-arrow`)
+  const desc    = document.getElementById(`${id}-desc`)
+  const errEl   = document.getElementById('wallet-error')
+
+  // ── Resolve the correct isolated EIP-1193 provider via EIP-6963 registry ─
+  // resolveProvider() picks the wallet-specific provider, never the wrong one.
+  const provider = resolveProvider(type)
+
+  // ── Not installed — redirect to Chrome Web Store ───────────────────────
+  if (!provider) {
+    const storeUrl = type === 'metamask' ? CHROME_MM : CHROME_OKX
+    showWalletError(`${name} extension not detected. Opening Chrome Web Store…`)
+    setTimeout(() => window.open(storeUrl, '_blank'), 800)
+    return
+  }
+
+  // ── Show connecting animation ──────────────────────────────────────────
+  errEl.style.display   = 'none'
+  opt.style.borderColor = color + '60'
+  opt.style.background  = type === 'metamask' ? 'rgba(245,132,31,.06)' : 'rgba(255,255,255,.04)'
+  shimmer.style.display = ''
+  arrow.style.display   = 'none'
+  desc.innerHTML = `<span style="color:${color};display:flex;align-items:center;gap:6px">
+    <span style="animation:spin .8s linear infinite;display:inline-block">↻</span>
+    Waiting for ${name}…
+  </span>`
+
+  try {
+    // ── Step 1: Request accounts — opens the wallet connection popup ──────
+    const accounts = await provider.request({ method: 'eth_requestAccounts' })
+
+    if (!accounts || accounts.length === 0) {
+      throw new Error('No accounts returned from wallet.')
+    }
+
+    const addr = accounts[0]
+
+    // ── Step 2: Check current chain — only act if NOT already on Arc ──────
+    // This prevents showing any popup to users who already have Arc set up.
+    let currentChain = null
     try {
-      const success = await attemptCharge(sub)
-      if (!success) {
-        await scheduleRetry(sub, 1)
-        if (sub.grace_period_sec > 0) {
-          await markOverdue(sub)
-        }
-      }
-    } catch (err) {
-      console.error(`[billing] payment error subId=${sub.id}:`, err)
-    }
-  }
-}
+      currentChain = await provider.request({ method: 'eth_chainId' })
+    } catch(e) { /* provider may not support eth_chainId before full connect */ }
 
-// ── 2. Process retry queue ────────────────────────────────────
-async function processRetries() {
-  const { rows } = await db.query(
-    `SELECT * FROM subscriptions
-     WHERE retry_count > 0
-       AND retry_count <= 3
-       AND next_retry_at <= NOW()
-       AND status IN ('active','overdue','paused')`
-  )
+    const alreadyOnArc = currentChain &&
+      currentChain.toLowerCase() === '0x4cef52'
 
-  for (const sub of rows) {
-    try {
-      const success = await attemptCharge(sub)
-      if (success) {
-        await db.query(
-          `UPDATE subscriptions
-           SET retry_count=0, failed_attempts=0, next_retry_at=NULL,
-               status='active', updated_at=NOW()
-           WHERE id=$1`,
-          [sub.id]
-        )
-        await sendNotification(sub.subscriber_wallet, 'payment_success',
-          `Your payment for ${sub.plan_name} was successful.`)
-        await sendMerchantNotification(sub.merchant_wallet, 'payment_success',
-          `Payment recovered for subscriber ${sub.subscriber_wallet}.`)
-      } else {
-        if (sub.retry_count >= 3) {
-          // All retries exhausted — pause subscription
-          await db.query(
-            `UPDATE subscriptions
-             SET status='paused', updated_at=NOW()
-             WHERE id=$1`,
-            [sub.id]
-          )
-          await sendNotification(sub.subscriber_wallet, 'payment_failed',
-            `Your subscription has been paused after 3 failed payment attempts.`)
-          await sendMerchantNotification(sub.merchant_wallet, 'payment_failed',
-            `Subscription ${sub.id} paused — 3 retries exhausted.`)
-          await dispatchWebhook(sub.merchant_wallet, 'payment_failed', sub)
-        } else {
-          await scheduleRetry(sub, sub.retry_count + 1)
-        }
-      }
-    } catch (err) {
-      console.error(`[retry] error subId=${sub.id}:`, err)
-    }
-  }
-}
-
-// ── 3. Check and suspend overdue subscriptions ────────────────
-async function processGraceExpiry() {
-  const { rows } = await db.query(
-    `SELECT s.*, p.name AS plan_name
-     FROM subscriptions s
-     JOIN plans p ON s.plan_id = p.id
-     WHERE s.status = 'overdue'
-       AND s.grace_period_end < NOW()`
-  )
-  for (const sub of rows) {
-    await db.query(
-      `UPDATE subscriptions SET status='suspended', updated_at=NOW() WHERE id=$1`,
-      [sub.id]
-    )
-    await sendNotification(sub.subscriber_wallet, 'grace_period',
-      `Your subscription to ${sub.plan_name} has been suspended.`)
-    await dispatchWebhook(sub.merchant_wallet, 'subscription_suspended', sub)
-  }
-}
-
-// ── 4. Trial ending reminders (2 days before) ─────────────────
-async function procesTrialReminders() {
-  const { rows } = await db.query(
-    `SELECT s.*, p.name AS plan_name
-     FROM subscriptions s
-     JOIN plans p ON s.plan_id = p.id
-     WHERE s.payment_count = 0
-       AND s.status = 'active'
-       AND s.next_payment BETWEEN NOW() AND NOW() + INTERVAL '2 days'`
-  )
-  for (const sub of rows) {
-    await sendNotification(sub.subscriber_wallet, 'trial_ending',
-      `Your free trial for ${sub.plan_name} ends in 2 days.`)
-    await dispatchWebhook(sub.merchant_wallet, 'trial_ending', sub)
-  }
-}
-
-// ─────────────────────────────────────────────────────────────
-//  CORE CHARGE LOGIC
-//  In practice this calls the on-chain contract via a relayer.
-//  Here we record the intent and track state; the on-chain tx
-//  is confirmed by listening to PaymentProcessed events.
-// ─────────────────────────────────────────────────────────────
-async function attemptCharge(sub: any): Promise<boolean> {
-  // Check if subscriber has sufficient balance on Arc
-  const balanceHex = await arcClient.getBalance({ address: sub.subscriber_wallet as `0x${string}` })
-  const balance    = parseFloat(formatUnits(balanceHex, 18))
-  const amount     = parseFloat(sub.amount)
-
-  // Try backup wallet if primary is insufficient
-  let payerWallet  = sub.subscriber_wallet
-  let usingBackup  = false
-
-  if (balance < amount && sub.backup_wallet) {
-    const backupBal = await arcClient.getBalance({ address: sub.backup_wallet as `0x${string}` })
-    const backupBalance = parseFloat(formatUnits(backupBal, 18))
-    if (backupBalance >= amount) {
-      payerWallet = sub.backup_wallet
-      usingBackup = true
-    } else {
-      await recordPaymentFailure(sub, `Insufficient balance: ${balance} < ${amount}`)
-      return false
-    }
-  } else if (balance < amount) {
-    await recordPaymentFailure(sub, `Insufficient balance: ${balance} < ${amount}`)
-    return false
-  }
-
-  // Record successful payment event
-  await db.query(
-    `INSERT INTO payment_events
-       (subscription_id, event_type, amount, attempt_number, metadata)
-     VALUES ($1, 'success', $2, $3, $4)`,
-    [
-      sub.id,
-      sub.amount,
-      sub.retry_count + 1,
-      JSON.stringify({ payer: payerWallet, usingBackup })
-    ]
-  )
-
-  // Compute next billing date
-  const intervalMap: Record<string, string> = {
-    weekly:   '7 days',
-    monthly:  '30 days',
-    annually: '365 days',
-  }
-  const interval = intervalMap[sub.interval_type] || `${sub.interval_seconds} seconds`
-
-  await db.query(
-    `UPDATE subscriptions
-     SET last_payment   = NOW(),
-         payment_count  = payment_count + 1,
-         failed_attempts= 0,
-         retry_count    = 0,
-         next_retry_at  = NULL,
-         grace_period_end = NULL,
-         status         = 'active',
-         next_payment   = NOW() + INTERVAL '${interval}',
-         updated_at     = NOW()
-     WHERE id = $1`,
-    [sub.id]
-  )
-
-  // Log payout split
-  const merchantPct  = (sub.merchant_share_bps  || 9500) / 10000
-  const platformPct  = (sub.platform_share_bps  || 500)  / 10000
-  const affiliatePct = (sub.affiliate_share_bps || 0)    / 10000
-  await db.query(
-    `INSERT INTO payout_logs
-       (subscription_id, merchant_amount, platform_amount, affiliate_amount, affiliate_wallet)
-     VALUES ($1,$2,$3,$4,$5)`,
-    [
-      sub.id,
-      amount * merchantPct,
-      amount * platformPct,
-      amount * affiliatePct,
-      sub.affiliate_wallet || null
-    ]
-  )
-
-  await dispatchWebhook(sub.merchant_wallet, 'payment_success', sub)
-  await refreshAnalytics(sub.merchant_wallet)
-  return true
-}
-
-async function recordPaymentFailure(sub: any, reason: string) {
-  await db.query(
-    `INSERT INTO payment_events
-       (subscription_id, event_type, amount, attempt_number, error_message)
-     VALUES ($1,'failed',$2,$3,$4)`,
-    [sub.id, sub.amount, sub.retry_count + 1, reason]
-  )
-  await db.query(
-    `UPDATE subscriptions
-     SET failed_attempts = failed_attempts + 1,
-         updated_at = NOW()
-     WHERE id = $1`,
-    [sub.id]
-  )
-}
-
-async function scheduleRetry(sub: any, attempt: number) {
-  const delayMap: Record<number, string> = {
-    1: '6 hours',
-    2: '24 hours',
-    3: '48 hours',
-  }
-  const delay = delayMap[attempt] || '48 hours'
-  await db.query(
-    `UPDATE subscriptions
-     SET retry_count   = $1,
-         next_retry_at = NOW() + INTERVAL '${delay}',
-         updated_at    = NOW()
-     WHERE id = $2`,
-    [attempt, sub.id]
-  )
-  await sendNotification(sub.subscriber_wallet, 'retry_scheduled',
-    `Payment retry #${attempt} scheduled in ${delay}.`)
-}
-
-async function markOverdue(sub: any) {
-  const { rows } = await db.query(`SELECT grace_period_sec FROM plans WHERE id=$1`, [sub.plan_id])
-  const graceSec = rows[0]?.grace_period_sec || 0
-  if (graceSec > 0) {
-    await db.query(
-      `UPDATE subscriptions
-       SET status='overdue',
-           grace_period_end = NOW() + (${graceSec} * INTERVAL '1 second'),
-           updated_at=NOW()
-       WHERE id=$1`,
-      [sub.id]
-    )
-  }
-}
-
-// ─────────────────────────────────────────────────────────────
-//  WEBHOOK DELIVERY
-// ─────────────────────────────────────────────────────────────
-async function dispatchWebhook(merchantWallet: string, eventType: string, payload: any) {
-  const { rows } = await db.query(
-    `SELECT id, webhook_url, webhook_secret FROM merchants WHERE wallet_address=$1`,
-    [merchantWallet]
-  )
-  if (!rows.length || !rows[0].webhook_url) return
-
-  const merchant  = rows[0]
-  const body      = JSON.stringify({ event: eventType, data: payload, timestamp: Date.now() })
-  const signature = crypto
-    .createHmac('sha256', merchant.webhook_secret)
-    .update(body)
-    .digest('hex')
-
-  await db.query(
-    `INSERT INTO webhook_deliveries
-       (merchant_id, event_type, payload, signature, url)
-     VALUES ($1,$2,$3,$4,$5)`,
-    [merchant.id, eventType, payload, `sha256=${signature}`, merchant.webhook_url]
-  )
-
-  // Deliver asynchronously
-  setImmediate(async () => {
-    let attempts = 0
-    while (attempts < 3) {
+    if (!alreadyOnArc) {
+      // User is on a different network — ask wallet to switch to Arc
       try {
-        const res = await fetch(merchant.webhook_url, {
-          method:  'POST',
-          headers: {
-            'Content-Type':     'application/json',
-            'X-ArcSub-Sig':     `sha256=${signature}`,
-            'X-ArcSub-Event':   eventType,
-          },
-          body,
-          signal: AbortSignal.timeout(10_000),
+        await provider.request({
+          method: 'wallet_switchEthereumChain',
+          params: [{ chainId: '0x4CEF52' }],
         })
-        await db.query(
-          `UPDATE webhook_deliveries
-           SET status_code=$1, delivered_at=NOW(), attempts=$2
-           WHERE merchant_id=$3 AND event_type=$4
-           ORDER BY created_at DESC LIMIT 1`,
-          [res.status, attempts + 1, merchant.id, eventType]
-        )
-        break
-      } catch (e) {
-        attempts++
-        if (attempts < 3) await sleep(2000 * attempts)
+        // Switch succeeded — Arc was already in wallet's network list
+      } catch (switchErr) {
+        if (switchErr.code === 4902) {
+          // Arc Testnet not in wallet yet — ask wallet to add it
+          // This is the ONLY scenario where the "Add Network" popup appears
+          try {
+            await provider.request({
+              method: 'wallet_addEthereumChain',
+              params: [{
+                chainId:           '0x4CEF52',
+                chainName:         'Arc Testnet',
+                nativeCurrency:    { name: 'USD Coin', symbol: 'USDC', decimals: 18 },
+                rpcUrls:           ['https://rpc.testnet.arc.network'],
+                blockExplorerUrls: ['https://testnet.arcscan.app'],
+              }],
+            })
+          } catch (addErr) {
+            if (addErr.code === 4001) {
+              // User rejected adding Arc — warn but continue connected
+              console.warn('User declined adding Arc Testnet network')
+            } else {
+              console.warn('wallet_addEthereumChain error:', addErr.message)
+            }
+          }
+        } else if (switchErr.code === 4001) {
+          // User rejected the switch — they stay on their current chain
+          // We continue connected; balance fetch will still work
+          console.warn('User declined switching to Arc Testnet')
+        } else {
+          console.warn('wallet_switchEthereumChain error:', switchErr.message)
+        }
       }
     }
+    // If alreadyOnArc === true: no popup shown, proceed directly to success
+
+    // ── Success ────────────────────────────────────────────────────────────
+    STATE.connected = true
+    STATE.wallet    = type
+    STATE.address   = addr
+    STATE.provider  = provider
+    STATE.balance   = 0  // will be replaced by real on-chain value below
+
+    // Listen for account/chain changes
+    provider.on('accountsChanged', accs => {
+      if (!accs.length) { disconnectWallet() }
+      else {
+        STATE.address = accs[0]
+        fetchUsdcBalance().then(updateWalletUI)
+      }
+    })
+    provider.on('chainChanged', () => window.location.reload())
+
+    // Show connected UI immediately with loading balance
+    STATE.balance = null  // null → shows "… USDC" loading state
+    closeWalletModal()
+    updateWalletUI()
+
+    // Fetch real balance from ArcScan explorer
+    await fetchUsdcBalance()
+    // updateBalanceDisplays() is called inside fetchUsdcBalance → setBalance()
+    toast('Connected!', `${name} · ${shortAddr(addr)}`, type === 'metamask' ? '\u{1F98A}' : '\u2B1B')
+
+  } catch (err) {
+    // Reset animation
+    shimmer.style.display = 'none'
+    arrow.style.display   = ''
+    opt.style.borderColor = 'var(--border)'
+    opt.style.background  = 'var(--bg-2)'
+    desc.textContent      = `Connect using ${name} browser extension`
+
+    if (err.code === 4001 || err.code === -32603) {
+      showWalletError('Connection rejected. Please approve the request in your wallet.')
+    } else if (err.message && err.message.includes('already pending')) {
+      showWalletError('A connection request is already pending. Open your wallet to approve it.')
+    } else {
+      showWalletError(err.message || 'Connection failed. Please try again.')
+    }
+  }
+}
+
+function showWalletError(msg) {
+  const el = document.getElementById('wallet-error')
+  el.textContent    = msg
+  el.style.display  = ''
+}
+
+// ══════════════════════════════════════════════
+// ON-CHAIN USDC BALANCE
+//
+// Arc's native token IS USDC (18 decimals at
+// the EVM level). We read it with eth_getBalance
+// routed through the wallet extension — this is
+// the ONLY approach that works from a local HTML
+// file because browser fetch() is blocked by
+// CORS on all external RPC/API endpoints.
+//
+// Flow:
+//  1. Ask wallet which chain it's on (eth_chainId)
+//  2. If NOT Arc (0x4CEF52 = 5042002), switch chain
+//  3. Call eth_getBalance via wallet provider
+//  4. Result is hex Wei → divide by 1e18 = USDC
+//
+// ArcScan link for manual verification:
+//   https://testnet.arcscan.app/address/{addr}
+// ══════════════════════════════════════════════
+const USDC_CONTRACT = '0x3600000000000000000000000000000000000000'
+const ARC_CHAIN_ID  = '0x4CEF52'  // 5042002 decimal
+
+async function fetchUsdcBalance() {
+  if (!STATE.address) return
+
+  const addr = STATE.address
+
+  // ── Strategy A: wallet provider eth_getBalance ────────────────────────
+  // Goes through the wallet extension — zero CORS issues from file://.
+  // Wallet must be on Arc for this to return the correct balance.
+  // This is the reliable path; wallet was switched to Arc on connect.
+  if (STATE.provider) {
+    try {
+      const hex = await STATE.provider.request({
+        method: 'eth_getBalance',
+        params: [addr, 'latest'],
+      })
+      if (hex && hex !== '0x' && hex !== '0x0') {
+        const wei     = BigInt(hex)
+        const balance = Number(wei) / 1e18
+        setBalance(balance)
+        console.log('[balance] wallet →', balance.toFixed(4), 'USDC')
+        return balance
+      }
+    } catch (e) {
+      console.warn('[balance] wallet eth_getBalance failed:', e.message)
+    }
+  }
+
+  // ── Strategy B: direct fetch to Arc RPC (fallback) ────────────────────
+  // Works when page is served from http:// (CORS allowed on Arc RPC).
+  // May be blocked from file:// in some browsers — hence fallback only.
+  try {
+    const resp = await fetch('https://rpc.testnet.arc.network', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        jsonrpc: '2.0', id: 1,
+        method:  'eth_getBalance',
+        params:  [addr, 'latest'],
+      }),
+    })
+    const json = await resp.json()
+    if (json.result && json.result !== '0x' && json.result !== '0x0') {
+      const wei     = BigInt(json.result)
+      const balance = Number(wei) / 1e18
+      setBalance(balance)
+      console.log('[balance] Arc RPC →', balance.toFixed(4), 'USDC')
+      return balance
+    }
+  } catch (e) {
+    console.warn('[balance] Arc RPC fetch failed:', e.message)
+  }
+
+  console.error('[balance] all sources failed for', addr)
+}
+
+// Re-fetch balance up to `retries` times until it changes from `prevBalance`.
+// Used after a transaction to confirm the on-chain deduction landed.
+async function fetchUsdcBalanceUntilChanged(prevBalance, retries = 15, delayMs = 1000) {
+  for (let i = 0; i < retries; i++) {
+    await new Promise(r => setTimeout(r, delayMs))
+    const fresh = await fetchUsdcBalance()
+    if (fresh !== undefined && fresh !== prevBalance) {
+      console.log('[balance] changed:', prevBalance, '→', fresh)
+      return fresh
+    }
+  }
+  // Last resort: just show whatever the latest read returned
+  await fetchUsdcBalance()
+}
+
+function setBalance(balance) {
+  STATE.balance = balance
+  updateBalanceDisplays()
+}
+
+// Poll every 10 s while connected
+setInterval(() => {
+  if (STATE.connected) fetchUsdcBalance()
+}, 10000)
+
+// ══════════════════════════════════════════════
+// WALLET UI
+// ══════════════════════════════════════════════
+function shortAddr(a) { return a.slice(0,6)+'…'+a.slice(-4) }
+
+function updateWalletUI() {
+  const area = document.getElementById('wallet-area')
+  if (STATE.connected) {
+    const walletIcon = STATE.wallet === 'okx'
+      ? `<svg width="13" height="13" viewBox="0 0 32 32" style="vertical-align:middle"><rect x="4" y="4" width="10" height="10" rx="1.5" fill="currentColor"/><rect x="18" y="4" width="10" height="10" rx="1.5" fill="currentColor"/><rect x="4" y="18" width="10" height="10" rx="1.5" fill="currentColor"/><rect x="18" y="18" width="10" height="10" rx="1.5" fill="currentColor"/></svg>`
+      : `<svg width="13" height="13" viewBox="0 0 35 35" style="vertical-align:middle"><path d="M32.9 1L19.4 11.1l2.5-5.9L32.9 1z" fill="#E2761B"/><path d="M2.1 1l13.4 10.2-2.4-6L2.1 1z" fill="#E4761B"/></svg>`
+
+    area.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;position:relative" id="wallet-connected-area">
+        <div class="balance-pill" id="balance-pill">
+          ${walletIcon} <span id="balance-display">Fetching…</span>
+        </div>
+        <button class="wallet-btn-addr" onclick="toggleDisconnectDrop(event)">
+          <span class="wallet-dot"></span>
+          ${shortAddr(STATE.address)}
+          <span style="font-size:9px;opacity:.6">▾</span>
+        </button>
+      </div>`
+
+    // Set sidebar addresses
+    document.getElementById('sidebar-addr').textContent = shortAddr(STATE.address)
+    document.getElementById('user-sidebar-addr').textContent = shortAddr(STATE.address)
+    // Balance displays will be updated by updateBalanceDisplays() once fetched
+    document.getElementById('sidebar-balance').textContent = 'Fetching…'
+    document.getElementById('user-sidebar-balance').textContent = 'Fetching…'
+  } else {
+    area.innerHTML = `<button class="wallet-btn-connect" onclick="openWalletModal()">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 12V22H4V12"/><path d="M22 7H2v5h20V7z"/><path d="M12 22V7"/></svg>
+      Connect Wallet</button>`
+    document.getElementById('sidebar-addr').textContent = 'Not connected'
+    document.getElementById('sidebar-balance').textContent = '—'
+    document.getElementById('user-sidebar-addr').textContent = 'Not connected'
+    document.getElementById('user-sidebar-balance').textContent = '—'
+  }
+}
+
+function toggleDisconnectDrop(e) {
+  e.stopPropagation()
+  const area = document.getElementById('wallet-connected-area')
+  if (!area) return
+  const existing = document.getElementById('disconnect-drop')
+  if (existing) { existing.remove(); return }
+
+  const wName = STATE.wallet === 'metamask' ? 'MetaMask' : 'OKX Wallet'
+  const drop  = document.createElement('div')
+  drop.id     = 'disconnect-drop'
+  drop.className = 'disconnect-drop'
+  drop.innerHTML = `
+    <div style="padding:13px 16px;border-bottom:1px solid var(--border);background:var(--bg-3)">
+      <div style="font-family:var(--font-m);font-size:10px;color:var(--text-2);margin-bottom:4px;letter-spacing:1px">VIA ${wName.toUpperCase()}</div>
+      <div style="font-family:var(--font-m);font-size:13px;color:var(--cyan)">${STATE.address.slice(0,10)}…${STATE.address.slice(-6)}</div>
+    </div>
+    <div style="padding:11px 16px;border-bottom:1px solid var(--border);font-family:var(--font-m);font-size:12px;display:flex;justify-content:space-between">
+      <span style="color:var(--text-2)">USDC Balance</span>
+      <span style="color:var(--cyan)" id="drop-balance">Fetching…</span>
+    </div>
+    <div class="drop-item" onclick="window.open('https://testnet.arcscan.app/address/${STATE.address}','_blank');event.stopPropagation()">View on ArcScan <span style="color:var(--cyan);opacity:.7">↗</span></div>
+    <div class="drop-item danger" onclick="disconnectWallet();event.stopPropagation()">Disconnect <span>⏻</span></div>`
+
+  // Stop clicks inside the dropdown from bubbling to document close handler
+  drop.addEventListener('click', ev => ev.stopPropagation())
+  area.appendChild(drop)
+
+  // Register close-on-outside-click on next tick so this same click doesn't trigger it
+  setTimeout(() => {
+    document.addEventListener('click', closeDropOnOutside)
+  }, 0)
+}
+
+function closeDropOnOutside() {
+  const d = document.getElementById('disconnect-drop')
+  if (d) d.remove()
+  document.removeEventListener('click', closeDropOnOutside)
+}
+
+function disconnectWallet() {
+  STATE.connected = false
+  STATE.address   = ''
+  STATE.wallet    = ''
+  updateWalletUI()
+  toast('Disconnected','Wallet disconnected','🔌')
+}
+
+// ══════════════════════════════════════════════
+// BALANCE — immediate deduction with flash
+// ══════════════════════════════════════════════
+// ══════════════════════════════════════════════
+// TX HELPERS
+// ══════════════════════════════════════════════
+
+// Encode a hex address to a 32-byte padded ABI parameter
+function encodeAddress(addr) {
+  // Strip 0x, lowercase, left-pad to 64 hex chars
+  const clean = addr.replace(/^0x/i, '').toLowerCase()
+  return clean.padStart(64, '0')
+}
+
+// Encode a number to a 32-byte padded ABI uint256
+// Uses BigInt to avoid floating-point precision loss with 1e18 values
+function encodeUint256(value) {
+  // Convert to BigInt safely: multiply integer part by 1 to drop any float drift
+  const big = BigInt(Math.round(value).toString())
+  const hex = big.toString(16)
+  return hex.padStart(64, '0')
+}
+
+// Poll for transaction receipt until mined on Arc.
+// Arc has sub-second finality — usually confirmed within 1-2 polls.
+// Uses wallet provider first (no CORS), falls back to fetch().
+async function waitForReceipt(txHash, maxAttempts = 30, intervalMs = 1000) {
+  for (let i = 0; i < maxAttempts; i++) {
+    // Short wait before first poll — give Arc time to include the tx
+    await new Promise(r => setTimeout(r, intervalMs))
+
+    let receipt = null
+
+    // Try wallet provider first (works from file://)
+    if (STATE.provider) {
+      try {
+        receipt = await STATE.provider.request({
+          method: 'eth_getTransactionReceipt',
+          params: [txHash],
+        })
+      } catch (e) { /* ignore, try fetch fallback */ }
+    }
+
+    // Fallback to direct Arc RPC fetch
+    if (!receipt) {
+      try {
+        const resp = await fetch('https://rpc.testnet.arc.network', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({
+            jsonrpc: '2.0', id: 1,
+            method:  'eth_getTransactionReceipt',
+            params:  [txHash],
+          }),
+        })
+        const json = await resp.json()
+        receipt = json.result
+      } catch (e) { /* ignore */ }
+    }
+
+    if (receipt && receipt.blockNumber) {
+      if (receipt.status === '0x0') {
+        throw new Error('Transaction reverted on Arc.')
+      }
+      console.log('[tx] confirmed in block', parseInt(receipt.blockNumber, 16))
+      return receipt
+    }
+  }
+  console.warn('[tx] receipt timeout — balance refresh will run anyway')
+  return null
+}
+
+// Human-readable next payment label based on interval
+function nextPaymentLabel(interval) {
+  const d = new Date()
+  if (interval === 'Weekly')   d.setDate(d.getDate() + 7)
+  if (interval === 'Monthly')  d.setMonth(d.getMonth() + 1)
+  if (interval === 'Annually') d.setFullYear(d.getFullYear() + 1)
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+}
+
+function deductBalance(amount, label) {
+  // Optimistic deduction — immediately reflect in UI while tx confirms
+  const current = (STATE.balance !== null && !isNaN(STATE.balance)) ? STATE.balance : 0
+  STATE.balance = Math.max(0, current - amount)
+  flashBalance('down')
+  updateBalanceDisplays()
+  const fakeTx = '0x' + Math.random().toString(16).slice(2,10) + '…'
+  toast('Payment Confirmed', `${label} · -${amount.toFixed(2)} USDC · tx: ${fakeTx}`, '✅')
+  // Re-fetch real on-chain balance after tx confirms on Arc (~1-2s)
+  setTimeout(() => fetchUsdcBalance(), 3000)
+}
+
+function fmtBalance(n) {
+  if (n === undefined || n === null || isNaN(n)) return 'Fetching…'
+  // Match ArcScan precision: 4 dp up to 1000, 2 dp above
+  const dp = n < 1 ? 6 : n < 1000 ? 4 : 2
+  return n.toFixed(dp) + ' USDC'
+}
+
+function updateBalanceDisplays() {
+  const v = fmtBalance(STATE.balance)
+  ;['balance-display', 'sidebar-balance', 'user-sidebar-balance', 'drop-balance'].forEach(id => {
+    const el = document.getElementById(id)
+    if (el) el.textContent = v
   })
 }
 
-// ─────────────────────────────────────────────────────────────
-//  NOTIFICATIONS
-// ─────────────────────────────────────────────────────────────
-async function sendNotification(wallet: string, type: string, body: string) {
-  await db.query(
-    `INSERT INTO notifications (recipient_wallet, channel, type, body)
-     VALUES ($1,'in_app',$2,$3)`,
-    [wallet, type, body]
-  )
-  // Extend: push to email/Telegram/push service here
+function flashBalance(direction) {
+  const pill = document.getElementById('balance-pill')
+  if (!pill) return
+  pill.className = `balance-pill flash-${direction}`
+  setTimeout(() => { pill.className = 'balance-pill' }, 1800)
 }
 
-async function sendMerchantNotification(wallet: string, type: string, body: string) {
-  await sendNotification(wallet, type, body)
+// ══════════════════════════════════════════════
+// NAVIGATION
+// ══════════════════════════════════════════════
+function showPage(pageId) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'))
+  document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'))
+  document.getElementById('page-' + pageId).classList.add('active')
+  const nl = document.getElementById('nl-' + pageId)
+  if (nl) nl.classList.add('active')
+  window.scrollTo(0,0)
+  if (pageId === 'browse')   renderPlans()
+  if (pageId === 'merchant') renderMerchant()
+  if (pageId === 'dashboard') renderDashboard()
 }
 
-// ─────────────────────────────────────────────────────────────
-//  ANALYTICS
-// ─────────────────────────────────────────────────────────────
-async function refreshAnalytics(merchantWallet: string) {
-  const period = new Date().toISOString().slice(0, 7)   // 'YYYY-MM'
-  await db.query(`SELECT refresh_merchant_analytics($1,$2)`, [merchantWallet, period])
+// ══════════════════════════════════════════════
+// BROWSE
+// ══════════════════════════════════════════════
+function renderPlans() {
+  const q  = (document.getElementById('search-plans')?.value || '').toLowerCase()
+  const fi = document.getElementById('filter-interval')?.value || ''
+  const ft = document.getElementById('filter-token')?.value || ''
+  const filtered = PLANS
+    .filter(p =>
+      (!q  || p.name.toLowerCase().includes(q)) &&
+      (!fi || p.interval === fi) &&
+      (!ft || p.token === ft)
+    )
+    .sort((a, b) => a.price - b.price)  // always lowest → highest
+  const grid = document.getElementById('plan-grid')
+  if (!grid) return
+  grid.innerHTML = filtered.map(p => `
+    <div class="plan-card" onclick="openSubscribeModal(${p.id})">
+      <div style="position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,${p.color}88,transparent)"></div>
+      <div style="font-family:var(--font-m);font-size:10px;color:var(--text-2);margin-bottom:10px;display:flex;align-items:center;gap:6px">
+        <div style="width:16px;height:16px;border-radius:3px;background:${p.color};display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;color:#000;flex-shrink:0">${p.merchant.slice(2,3).toUpperCase()}</div>
+        ${p.merchant.slice(0,8)}…
+      </div>
+      <div style="font-family:var(--font-d);font-weight:700;font-size:17px;margin-bottom:6px;letter-spacing:-.3px">${p.name}</div>
+      <p style="font-size:12px;color:var(--text-1);line-height:1.6;flex:1;margin-bottom:18px">${p.desc}</p>
+      <div style="display:flex;align-items:baseline;gap:5px;margin-bottom:14px">
+        <span style="font-family:var(--font-m);font-size:24px;color:${p.color}">${p.price}</span>
+        <span style="font-family:var(--font-m);font-size:12px;color:var(--text-1)">${p.token}</span>
+        <span style="font-family:var(--font-m);font-size:11px;color:var(--text-2)">/ ${p.interval.toLowerCase()}</span>
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        ${[p.interval, p.token, p.trial>0?`${p.trial}d trial`:null, `${p.subs} subs`].filter(Boolean).map(t=>`<span style="font-family:var(--font-m);font-size:10px;padding:3px 7px;border-radius:4px;background:var(--bg-3);color:${t.endsWith('trial')?'var(--gold)':'var(--text-1)'};border:1px solid var(--border)">${t}</span>`).join('')}
+      </div>
+    </div>`).join('')
 }
 
-// ─────────────────────────────────────────────────────────────
-//  REST API
-// ─────────────────────────────────────────────────────────────
-
-// ── Auth middleware (API key) ─────────────────────────────────
-async function apiAuth(req: Request, res: Response, next: NextFunction) {
-  const key = req.headers['x-api-key'] as string
-  if (!key) return res.status(401).json({ error: 'Missing API key' })
-  const { rows } = await db.query(
-    `SELECT * FROM merchants WHERE api_key=$1`, [key]
-  )
-  if (!rows.length) return res.status(403).json({ error: 'Invalid API key' })
-  ;(req as any).merchant = rows[0]
-  next()
+// ══════════════════════════════════════════════
+// SUBSCRIBE MODAL
+// ══════════════════════════════════════════════
+function openSubscribeModal(planId) {
+  const plan = PLANS.find(p => p.id === planId)
+  if (!plan) return
+  STATE.activePlan = planId
+  const fee = (plan.price * 0.025).toFixed(4)
+  const net = (plan.price - fee).toFixed(4)
+  document.getElementById('sub-modal-body').innerHTML = `
+    <div style="background:var(--bg-2);border:1px solid var(--border);border-radius:var(--r-lg);padding:16px;margin-bottom:16px">
+      <div style="display:flex;align-items:center;gap:14px">
+        <div style="width:44px;height:44px;border-radius:10px;background:${plan.color}22;border:1px solid ${plan.color}44;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0">💎</div>
+        <div style="flex:1">
+          <div style="font-family:var(--font-d);font-weight:600;font-size:16px;margin-bottom:3px">${plan.name}</div>
+          <div style="font-family:var(--font-m);font-size:11px;color:var(--text-2)">Plan #${plan.id} · ${plan.merchant.slice(0,8)}…</div>
+        </div>
+        <div style="text-align:right">
+          <div style="font-family:var(--font-m);font-size:22px;color:${plan.color}">${plan.price}</div>
+          <div style="font-family:var(--font-m);font-size:10px;color:var(--text-2)">${plan.token} / ${plan.interval.toLowerCase()}</div>
+        </div>
+      </div>
+      ${plan.trial>0?`<div style="margin-top:10px;background:var(--green-dim);border:1px solid rgba(60,240,160,.2);border-radius:6px;padding:8px 12px;font-size:12px;color:var(--green)">✓ ${plan.trial}-day free trial — first charge after trial ends</div>`:''}
+    </div>
+    <div style="background:var(--cyan-dim);border:1px solid rgba(56,200,240,.2);border-radius:var(--r-md);padding:12px 14px;margin-bottom:14px;font-size:12px;color:var(--cyan);display:flex;gap:10px">
+      <span style="flex-shrink:0">ℹ️</span>
+      <div>Your wallet will open for confirmation. ${plan.trial>0 ? `<strong>${plan.trial}-day free trial</strong> — your wallet confirms the subscription but <strong>no charge today</strong>. First payment of ${plan.price} ${plan.token} begins after the trial.` : `Once approved, <strong>${plan.price} ${plan.token}</strong> will be sent directly to the merchant on Arc.`}</div>
+    </div>
+    <div style="margin-bottom:14px">
+      <label class="field-label" style="display:block;margin-bottom:6px">Promo Code (optional)</label>
+      <div class="coupon-input-row">
+        <input class="input" id="coupon-field" placeholder="e.g. WELCOME20" oninput="STATE.couponCode=this.value;STATE.couponValid=null;document.getElementById('coupon-status').innerHTML=''">
+        <button class="btn-ghost" onclick="validateCoupon()">Apply</button>
+      </div>
+      <div id="coupon-status"></div>
+    </div>
+    <div style="background:var(--bg-0);border:1px solid var(--border);border-radius:var(--r-md);padding:14px;margin-bottom:18px">
+      <div class="breakdown-row"><span style="color:var(--text-1)">Plan price</span><span style="font-family:var(--font-m);font-size:12px">${plan.price}.00 ${plan.token}</span></div>
+      <div class="breakdown-row"><span style="color:var(--text-1)">Platform fee (2.5%)</span><span style="font-family:var(--font-m);font-size:12px;color:var(--text-2)">${fee} ${plan.token}</span></div>
+      <div class="breakdown-row"><span style="color:var(--text-1)">Merchant receives</span><span style="font-family:var(--font-m);font-size:12px;color:var(--green)">${net} ${plan.token}</span></div>
+      <div class="breakdown-row total"><span>You pay now</span><span>${plan.trial>0?'Free (trial)':plan.price+' '+plan.token}</span></div>
+    </div>
+    <div style="display:flex;gap:10px;justify-content:flex-end">
+      <button class="btn-ghost" onclick="closeModal('modal-subscribe')">Cancel</button>
+      <button class="btn-primary" id="sub-btn" onclick="confirmSubscribe(${planId})" ${!STATE.connected?'disabled':''}>
+        ${STATE.connected?'Approve & Subscribe →':'Connect Wallet First'}
+      </button>
+    </div>`
+  document.getElementById('modal-subscribe').style.display = ''
 }
 
-// ── Plans ─────────────────────────────────────────────────────
-app.post('/api/plans', apiAuth, async (req, res) => {
-  const m = (req as any).merchant
-  const { name, description, price, interval_type, trial_days,
-          grace_period_sec, pause_allowed, token_symbol, token_address } = req.body
-  const { rows } = await db.query(
-    `INSERT INTO plans
-       (merchant_id, merchant_wallet, name, description, price, interval_type,
-        trial_days, grace_period_sec, pause_allowed, token_symbol, token_address)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-     RETURNING *`,
-    [m.id, m.wallet_address, name, description, price, interval_type,
-     trial_days||0, grace_period_sec||0, pause_allowed!==false, token_symbol||'USDC', token_address]
-  )
-  res.json({ plan: rows[0] })
+async function confirmSubscribe(planId) {
+  const plan = PLANS.find(p => p.id === planId)
+  if (!plan) return
+
+  if (!STATE.connected || !STATE.provider) {
+    toast('Not Connected', 'Please connect your wallet first', '⚠️')
+    return
+  }
+
+  const btn = document.getElementById('sub-btn')
+  btn.disabled = true
+
+  try {
+    const isTrial = plan.trial > 0
+
+    // ── Always open wallet popup ──────────────────────────────────────────
+    // Trial plans:    value = 0x0  (no charge, but user still confirms in wallet)
+    // Paid plans:     value = plan price in Wei
+    // Wallet popup always appears regardless of trial status.
+    btn.innerHTML = `<span style="animation:spin .8s linear infinite;display:inline-block">↻</span> ${isTrial ? 'Confirm trial in wallet…' : 'Waiting for wallet confirmation…'}`
+
+    const balanceBefore = STATE.balance
+
+    // For paid plans: convert price to Wei. For trials: send 0.
+    const valueHex = isTrial
+      ? '0x0'
+      : '0x' + BigInt(Math.round(plan.price * 1e18)).toString(16)
+
+    // eth_sendTransaction — opens the wallet confirmation popup for every plan
+    const txHash = await STATE.provider.request({
+      method: 'eth_sendTransaction',
+      params: [{
+        from:  STATE.address,
+        to:    plan.merchant,   // merchant receives the payment (or 0 for trial)
+        value: valueHex,
+      }],
+    })
+
+    // ── Poll for confirmation on Arc ──────────────────────────────────────
+    btn.innerHTML = '<span style="animation:spin .8s linear infinite;display:inline-block">↻</span> Confirming on Arc…'
+    await waitForReceipt(txHash)
+
+    if (isTrial) {
+      // Trial: no balance deduction — just show success
+      closeModal('modal-subscribe')
+      toast('Trial Started!', `${plan.name} · ${plan.trial}-day free trial · tx: ${txHash.slice(0,20)}…`, '✅')
+    } else {
+      // Paid: optimistic deduction then confirm with on-chain value
+      if (balanceBefore !== null) {
+        setBalance(Math.max(0, balanceBefore - plan.price))
+        flashBalance('down')
+      }
+      fetchUsdcBalanceUntilChanged(balanceBefore).then(() => flashBalance('down'))
+
+      closeModal('modal-subscribe')
+      toast('Subscribed!', `${plan.name} · -${plan.price} USDC · tx: ${txHash.slice(0,20)}…`, '✅')
+    }
+
+    USER_SUBS.push({
+      id: 200 + planId, planId: plan.id, planName: plan.name,
+      merchant: plan.merchant.slice(0,10)+'…', price: plan.price,
+      token: plan.token, interval: plan.interval,
+      start: new Date().toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}),
+      next: isTrial ? `Trial ends in ${plan.trial}d` : nextPaymentLabel(plan.interval),
+      payments: isTrial ? 0 : 1, status: 'active'
+    })
+    renderDashboard()
+
+  } catch (err) {
+    if (err.code === 4001) {
+      toast('Cancelled', 'Transaction rejected in wallet', '✕')
+    } else {
+      toast('Transaction Failed', err.message || 'Unknown error', '❌')
+      console.error('[subscribe] error:', err)
+    }
+  } finally {
+    btn.disabled  = false
+    btn.innerHTML = 'Approve & Subscribe →'
+  }
+}
+
+// ══════════════════════════════════════════════
+// CREATE PLAN MODAL
+// ══════════════════════════════════════════════
+function openCreatePlan() { document.getElementById('modal-create').style.display = '' }
+
+function selectInterval(val, el) {
+  document.querySelectorAll('.interval-opt').forEach(o => o.classList.remove('selected'))
+  el.classList.add('selected')
+  STATE.createInterval = val
+}
+
+function selectToken(val, el) {
+  document.querySelectorAll('.token-opt').forEach(o => o.classList.remove('selected'))
+  el.classList.add('selected')
+  STATE.createToken = val
+  document.getElementById('cp-token-suffix').textContent = val
+}
+
+function updateIntervalPreviews() {
+  const p = parseFloat(document.getElementById('cp-price')?.value) || 0
+  ;['Weekly','Monthly','Annually'].forEach(iv => {
+    const el = document.getElementById('prev-' + iv)
+    if (el) el.textContent = p > 0 ? `$${p}/${iv.slice(0,2).toLowerCase()}` : '—'
+  })
+}
+
+function submitCreatePlan() {
+  const name  = document.getElementById('cp-name').value.trim()
+  const price = parseFloat(document.getElementById('cp-price').value)
+  const errEl = document.getElementById('cp-error')
+  if (!name)           { errEl.textContent='Plan name is required'; errEl.style.display=''; return }
+  if (!price || price<=0) { errEl.textContent='Price must be greater than 0'; errEl.style.display=''; return }
+  if (!STATE.connected) { errEl.textContent='Connect your wallet first'; errEl.style.display=''; return }
+  errEl.style.display='none'
+  const btn = document.getElementById('cp-btn')
+  btn.disabled=true
+  btn.innerHTML='<span style="animation:spin .8s linear infinite;display:inline-block">↻</span> Deploying…'
+  setTimeout(() => {
+    closeModal('modal-create')
+    btn.disabled=false; btn.innerHTML='Deploy Plan →'
+    // Small gas fee
+    deductBalance(0.01, `createPlan(${name}) · gas`)
+    toast('Plan Created!', `"${name}" is live on Arc Testnet`, '🚀')
+    renderMerchant()
+  }, 2000)
+}
+
+// ══════════════════════════════════════════════
+// CHARGE MODAL
+// ══════════════════════════════════════════════
+function openChargeModal(subId) {
+  const sub = USER_SUBS.find(s => s.id === subId)
+  if (!sub) return
+  STATE.activeSub = subId
+  document.getElementById('charge-modal-body').innerHTML = `
+    <div style="background:var(--bg-2);border:1px solid var(--border);border-radius:var(--r-md);padding:14px;margin-bottom:16px">
+      <div style="font-family:var(--font-d);font-weight:600;font-size:15px;margin-bottom:4px">${sub.planName}</div>
+      <div style="font-family:var(--font-m);font-size:11px;color:var(--text-2)">Sub #${sub.id} · ${sub.interval} · ${sub.payments} payments made</div>
+    </div>
+    <div style="background:var(--bg-0);border:1px solid var(--border);border-radius:var(--r-md);padding:14px;margin-bottom:18px">
+      <div class="breakdown-row"><span style="color:var(--text-1)">Amount</span><span style="font-family:var(--font-m);font-size:12px">${sub.price}.00 ${sub.token}</span></div>
+      <div class="breakdown-row"><span style="color:var(--text-1)">Interval</span><span style="font-family:var(--font-m);font-size:12px">${sub.interval}</span></div>
+      <div class="breakdown-row total"><span>You pay</span><span>${sub.price}.00 ${sub.token}</span></div>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:space-between">
+      <button class="btn-danger" onclick="cancelSubConfirm(${subId})">Cancel Plan</button>
+      <div style="display:flex;gap:8px">
+        <button class="btn-ghost" onclick="closeModal('modal-charge')">Close</button>
+        <button class="btn-primary" id="charge-btn" onclick="confirmCharge(${subId})">Confirm Payment →</button>
+      </div>
+    </div>`
+  document.getElementById('modal-charge').style.display = ''
+}
+
+async function confirmCharge(subId) {
+  const sub = USER_SUBS.find(s => s.id === subId)
+  if (!sub) return
+
+  if (!STATE.connected || !STATE.provider) {
+    toast('Not Connected', 'Please connect your wallet first', '⚠️')
+    return
+  }
+
+  const btn = document.getElementById('charge-btn')
+  btn.disabled  = true
+  btn.innerHTML = '<span style="animation:spin .8s linear infinite;display:inline-block">↻</span> Waiting for wallet…'
+
+  try {
+    const plan        = PLANS.find(p => p.id === sub.planId)
+    const merchantAddr = plan ? plan.merchant : null
+
+    if (!merchantAddr || merchantAddr.length !== 42) {
+      throw new Error('Invalid merchant address')
+    }
+
+    const balanceBefore = STATE.balance
+
+    const priceWei = BigInt(Math.round(sub.price * 1e18)).toString(16)
+    const valueHex = '0x' + priceWei
+
+    // Opens wallet confirmation popup
+    const txHash = await STATE.provider.request({
+      method: 'eth_sendTransaction',
+      params: [{
+        from:  STATE.address,
+        to:    merchantAddr,
+        value: valueHex,
+      }],
+    })
+
+    btn.innerHTML = '<span style="animation:spin .8s linear infinite;display:inline-block">↻</span> Confirming on Arc…'
+    await waitForReceipt(txHash)
+
+    // Optimistic deduction, then on-chain confirmation
+    if (balanceBefore !== null) {
+      setBalance(Math.max(0, balanceBefore - sub.price))
+      flashBalance('down')
+    }
+    fetchUsdcBalanceUntilChanged(balanceBefore).then(() => flashBalance('down'))
+
+    sub.status   = 'active'
+    sub.payments += 1
+    sub.next     = nextPaymentLabel(sub.interval)
+
+    closeModal('modal-charge')
+    toast('Payment Confirmed!', `${sub.planName} · -${sub.price} USDC · tx: ${txHash.slice(0,20)}…`, '✅')
+    renderDashboard()
+
+  } catch (err) {
+    if (err.code === 4001) {
+      toast('Cancelled', 'Transaction rejected in wallet', '✕')
+    } else {
+      toast('Transaction Failed', err.message || 'Unknown error', '❌')
+    }
+  } finally {
+    btn.disabled  = false
+    btn.innerHTML = 'Confirm Payment →'
+  }
+}
+
+async function cancelSubConfirm(subId) {
+  const sub = USER_SUBS.find(s => s.id === subId)
+  if (!sub) return
+
+  if (!STATE.connected || !STATE.provider) {
+    toast('Not Connected', 'Please connect your wallet first', '⚠️')
+    return
+  }
+
+  // Cancellation is an on-chain state change (no token transfer).
+  // In the demo we send a 0-value tx to USDC contract as a proxy for
+  // calling cancelSubscription() on the real SubscriptionManager contract.
+  // The wallet popup will show for the user to confirm/reject.
+  try {
+    const btn = document.getElementById('cancel-btn-' + subId)
+    if (btn) { btn.disabled = true; btn.textContent = '↻ Cancelling…' }
+
+    // Send 0-value tx to own address — minimal gas tx, opens wallet to confirm
+    const txHash = await STATE.provider.request({
+      method: 'eth_sendTransaction',
+      params: [{
+        from:  STATE.address,
+        to:    STATE.address,
+        value: '0x0',
+      }],
+    })
+
+    await waitForReceipt(txHash)
+
+    // Re-fetch balance (gas was paid in USDC on Arc)
+    await fetchUsdcBalance()
+    updateBalanceDisplays()
+
+    sub.status = 'cancelled'
+    closeModal('modal-charge')
+    toast('Cancelled', `${sub.planName} cancelled on Arc · tx: ${txHash.slice(0,18)}…`, '🔴')
+    renderDashboard()
+  } catch (err) {
+    const msg = err.code === 4001 ? 'Cancellation rejected in wallet.' : (err.message || 'Failed.')
+    toast('Failed', msg, '❌')
+  }
+}
+
+// ══════════════════════════════════════════════
+// MERCHANT DASHBOARD
+// ══════════════════════════════════════════════
+function renderMerchant() {
+  renderMOverview()
+  renderMPlans()
+  renderMSubscribers()
+  renderMRevenue()
+  renderMSettings()
+}
+
+function merchantTab(id, el) {
+  document.querySelectorAll('[id^="m-"]').forEach(e=>e.style.display='none')
+  document.getElementById('m-'+id).style.display=''
+  document.querySelectorAll('.sidebar-item').forEach(s=>s.classList.remove('active'))
+  if(el) el.classList.add('active')
+}
+
+function renderMOverview() {
+  const el = document.getElementById('m-overview')
+  if(!el) return
+  const max = Math.max(...REVENUE_DATA.map(d=>d.v))
+  el.innerHTML = `
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:26px">
+      <div><h1 style="font-family:var(--font-d);font-weight:700;font-size:26px;letter-spacing:-.5px;margin-bottom:4px">Merchant Dashboard</h1><p style="font-size:13px;color:var(--text-1)">Apr 2026 · Arc Testnet</p></div>
+      <button class="btn-primary" onclick="openCreatePlan()">+ New Plan</button>
+    </div>
+    <div class="stats-row">
+      ${statCard('Monthly Recurring Revenue','$847','+12.4% vs last month','up','linear-gradient(90deg,transparent,var(--cyan),transparent)','var(--cyan)')}
+      ${statCard('Active Subscribers','24','+3 this week','up','linear-gradient(90deg,transparent,var(--gold),transparent)','var(--gold)')}
+      ${statCard('Lifetime Revenue','$4,210','All time','','linear-gradient(90deg,transparent,var(--green),transparent)','var(--green)')}
+      ${statCard('Churn Rate','3.2%','-0.8% vs last month','down','linear-gradient(90deg,transparent,var(--purple),transparent)','var(--purple)')}
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 300px;gap:16px;margin-bottom:16px">
+      <div class="card">
+        <div class="card-header"><span class="card-title">Revenue · Last 7 months</span><span style="font-family:var(--font-m);font-size:12px;color:var(--text-2)">USDC</span></div>
+        <div class="card-body">
+          <div class="bar-chart">
+            ${REVENUE_DATA.map(d=>`
+              <div class="bar-wrap">
+                <div style="flex:1;width:100%;display:flex;align-items:flex-end">
+                  <div class="bar" style="height:${(d.v/max)*100}%;background:linear-gradient(180deg,var(--cyan),rgba(56,200,240,.3));min-height:4px" title="${d.m}: $${d.v}"></div>
+                </div>
+                <div class="bar-label">${d.m}</div>
+              </div>`).join('')}
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header"><span class="card-title">Plans</span><button class="btn-ghost" onclick="merchantTab('plans',document.getElementById('ms-plans'))" style="font-size:11px;padding:3px 9px">View all</button></div>
+        ${PLANS.slice(0,4).map(p=>`
+          <div style="display:flex;align-items:center;padding:11px 20px;border-bottom:1px solid var(--border);gap:10px">
+            <div style="width:8px;height:8px;border-radius:50%;background:${p.color};flex-shrink:0"></div>
+            <span style="flex:1;font-size:13px;font-weight:500">${p.name}</span>
+            <span style="font-family:var(--font-m);font-size:11px;color:var(--text-1)">${p.subs}</span>
+            <span style="font-family:var(--font-m);font-size:11px;color:var(--cyan)">$${p.price}</span>
+          </div>`).join('')}
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><span class="card-title">Recent Subscriptions</span></div>
+      <div style="overflow-x:auto"><table class="data-table"><thead><tr><th>Subscriber</th><th>Plan</th><th>Amount</th><th>Payments</th><th>Next Due</th><th>Status</th></tr></thead><tbody>
+        ${[
+          {addr:'0x1a2b…3c4d',plan:'Premium Newsletter',amount:'10.00',payments:2,next:'May 1',status:'active'},
+          {addr:'0x2b3c…4d5e',plan:'SaaS Builder Pro',amount:'25.00',payments:1,next:'Apr 22',status:'paused'},
+          {addr:'0x3c4d…5e6f',plan:'Membership Pass',amount:'5.00',payments:3,next:'Apr 27',status:'active'},
+          {addr:'0x4d5e…6f7a',plan:'Research Vault',amount:'199.00',payments:1,next:'Mar 2027',status:'active'},
+        ].map(s=>`<tr><td class="td-mono">${s.addr}</td><td>${s.plan}</td><td class="td-mono" style="color:var(--cyan)">$${s.amount}</td><td class="td-mono">${s.payments}</td><td style="font-size:12px;color:var(--text-1)">${s.next}</td><td><span class="badge badge-${s.status}">${s.status}</span></td></tr>`).join('')}
+      </tbody></table></div>
+    </div>`
+}
+
+function statCard(label,val,delta,dir,bar,color){
+  return `<div class="stat-card"><div class="top-bar" style="background:${bar}"></div><div class="stat-card-inner">
+    <div class="stat-label">${label}</div>
+    <div class="stat-value" style="color:${color}">${val}</div>
+    <div class="stat-delta ${dir==='up'?'up':dir==='down'?'down':''}">${dir==='up'?'▲':dir==='down'?'▼':''} ${delta}</div>
+  </div></div>`
+}
+
+function renderMPlans() {
+  const el = document.getElementById('m-plans')
+  if(!el) return
+  el.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:26px">
+      <div><h1 style="font-family:var(--font-d);font-weight:700;font-size:26px;letter-spacing:-.5px;margin-bottom:4px">Your Plans</h1><p style="font-size:13px;color:var(--text-1)">Manage your subscription offerings</p></div>
+      <button class="btn-primary" onclick="openCreatePlan()">+ Create Plan</button>
+    </div>
+    ${PLANS.slice(0,4).map(p=>`
+    <div class="card" style="margin-bottom:12px;overflow:visible">
+      <div style="padding:20px 24px">
+        <div style="display:flex;align-items:flex-start;gap:16px">
+          <div style="width:44px;height:44px;border-radius:10px;background:${p.color}22;border:1px solid ${p.color}44;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0">${['📰','🔧','🏛️','📊'][p.id-1]||'📦'}</div>
+          <div style="flex:1">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
+              <span style="font-family:var(--font-d);font-weight:600;font-size:16px">${p.name}</span>
+              <span class="badge badge-active">active</span>
+            </div>
+            <p style="font-size:12px;color:var(--text-1);margin-bottom:12px;line-height:1.5">${p.desc}</p>
+            <div style="display:flex;gap:20px;font-family:var(--font-m);font-size:11px;color:var(--text-2);flex-wrap:wrap">
+              <span>Price: <span style="color:var(--cyan)">$${p.price} ${p.token}</span></span>
+              <span>Interval: <span style="color:var(--text-0)">${p.interval}</span></span>
+              <span>Subscribers: <span style="color:var(--gold)">${p.subs}</span></span>
+              ${p.trial>0?`<span>Trial: <span style="color:var(--green)">${p.trial}d</span></span>`:''}
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-shrink:0">
+            <button class="btn-ghost" style="font-size:11px">Edit</button>
+            <button class="btn-danger" style="font-size:11px">Pause</button>
+          </div>
+        </div>
+      </div>
+    </div>`).join('')}`
+}
+
+function renderMSubscribers() {
+  const el = document.getElementById('m-subscribers')
+  if(!el) return
+  const rows = [
+    {addr:'0x1a2b…3c4d',plan:'Premium Newsletter',amount:'10.00',payments:2,next:'May 1',status:'active'},
+    {addr:'0x2b3c…4d5e',plan:'SaaS Builder Pro',amount:'25.00',payments:1,next:'Apr 22',status:'paused'},
+    {addr:'0x3c4d…5e6f',plan:'Membership Pass',amount:'5.00',payments:3,next:'Apr 27',status:'active'},
+    {addr:'0x4d5e…6f7a',plan:'Research Vault',amount:'199.00',payments:1,next:'Mar 2027',status:'active'},
+    {addr:'0x5e6f…7a8b',plan:'Premium Newsletter',amount:'10.00',payments:2,next:'May 1',status:'active'},
+    {addr:'0x6f7a…8b9c',plan:'Membership Pass',amount:'5.00',payments:4,next:'Apr 26',status:'cancelled'},
+  ]
+  el.innerHTML = `
+    <div style="margin-bottom:26px"><h1 style="font-family:var(--font-d);font-weight:700;font-size:26px;letter-spacing:-.5px;margin-bottom:4px">Subscribers</h1><p style="font-size:13px;color:var(--text-1)">24 active across all plans</p></div>
+    <div class="card"><div style="overflow-x:auto"><table class="data-table"><thead><tr><th>Address</th><th>Plan</th><th>Amount</th><th>Payments</th><th>Next Due</th><th>Status</th><th>Actions</th></tr></thead><tbody>
+    ${rows.map(s=>`<tr><td class="td-mono">${s.addr}</td><td style="font-size:12px">${s.plan}</td><td class="td-mono" style="color:var(--cyan);font-size:12px">$${s.amount}</td><td class="td-mono" style="font-size:12px">${s.payments}</td><td style="font-size:12px;color:var(--text-1)">${s.next}</td><td><span class="badge badge-${s.status}">${s.status}</span></td><td>${s.status!=='cancelled'?`<button class="btn-danger" style="font-size:11px;padding:4px 8px" onclick="event.stopPropagation();toast('Cancelled','Subscription cancelled on Arc','🔴')">Cancel</button>`:''}</td></tr>`).join('')}
+    </tbody></table></div></div>`
+}
+
+function renderMRevenue() {
+  const el = document.getElementById('m-revenue')
+  if(!el) return
+  el.innerHTML = `
+    <div style="margin-bottom:26px"><h1 style="font-family:var(--font-d);font-weight:700;font-size:26px;letter-spacing:-.5px;margin-bottom:4px">Revenue Analytics</h1><p style="font-size:13px;color:var(--text-1)">Detailed financial breakdown</p></div>
+    <div class="stats-row" style="grid-template-columns:repeat(3,1fr)">
+      ${statCard('This Month','$847','+12.4%','up','linear-gradient(90deg,transparent,var(--cyan),transparent)','var(--cyan)')}
+      ${statCard('Platform Fees Paid','$105','2.5% on $4,210 total','','linear-gradient(90deg,transparent,var(--gold),transparent)','var(--gold)')}
+      ${statCard('Net Revenue','$4,105','After platform fee','up','linear-gradient(90deg,transparent,var(--green),transparent)','var(--green)')}
+    </div>
+    <div class="card"><div class="card-header"><span class="card-title">Revenue by Plan</span></div>
+    <div style="overflow-x:auto"><table class="data-table"><thead><tr><th>Plan</th><th>Price</th><th>Subscribers</th><th>Monthly</th><th>Lifetime</th><th>Share</th></tr></thead><tbody>
+    ${[{n:'Premium Newsletter',p:'$10',s:142,m:1420,l:5960},{n:'SaaS Builder Pro',p:'$25',s:67,m:1675,l:3450},{n:'Membership Pass',p:'$5',s:289,m:1445,l:7890},{n:'Research Vault',p:'$199',s:38,m:627,l:2550}].map(r=>{
+      const pct=((r.m/5167)*100).toFixed(0)
+      return `<tr><td style="font-weight:500">${r.n}</td><td class="td-mono" style="color:var(--cyan)">${r.p}</td><td class="td-mono" style="color:var(--gold)">${r.s}</td><td class="td-mono" style="color:var(--cyan)">$${r.m.toLocaleString()}</td><td class="td-mono">$${r.l.toLocaleString()}</td><td><div style="display:flex;align-items:center;gap:8px"><div style="flex:1;background:var(--bg-3);border-radius:2px;height:4px;min-width:60px"><div style="background:var(--cyan);height:100%;width:${pct}%;border-radius:2px"></div></div><span style="font-family:var(--font-m);font-size:10px;color:var(--text-2)">${pct}%</span></div></td></tr>`
+    }).join('')}
+    </tbody></table></div></div>`
+}
+
+function renderMSettings() {
+  const el = document.getElementById('m-settings')
+  if(!el) return
+  el.innerHTML = `
+    <div style="margin-bottom:26px"><h1 style="font-family:var(--font-d);font-weight:700;font-size:26px;letter-spacing:-.5px;margin-bottom:4px">Settings</h1><p style="font-size:13px;color:var(--text-1)">Contract & network configuration</p></div>
+    <div class="card" style="max-width:520px;margin-bottom:16px">
+      <div class="card-header"><span class="card-title">Network Info</span></div>
+      <div style="padding:8px 20px">
+        ${[['Network','Arc Testnet','var(--cyan)'],['Chain ID','5042002','var(--text-0)'],['RPC','rpc.testnet.arc.network','var(--text-0)'],['USDC','0x3600…0000','var(--text-0)'],['EURC','0x89B5…72a','var(--text-0)'],['Platform Fee','2.5% (250 bps)','var(--gold)']].map(([k,v,c])=>`
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid var(--border);font-size:13px">
+            <span style="color:var(--text-1)">${k}</span>
+            <span style="font-family:var(--font-m);font-size:12px;color:${c}">${v}</span>
+          </div>`).join('')}
+      </div>
+    </div>
+    <div class="card" style="max-width:520px">
+      <div class="card-header"><span class="card-title">Get Testnet USDC</span></div>
+      <div style="padding:18px 22px"><p style="font-size:13px;color:var(--text-1);margin-bottom:14px">Fund your wallet from the Circle faucet to pay for gas and subscriptions.</p>
+      <button class="btn-secondary" onclick="window.open('https://faucet.circle.com','_blank')">Visit Circle Faucet ↗</button></div>
+    </div>`
+}
+
+// ══════════════════════════════════════════════
+// USER DASHBOARD
+// ══════════════════════════════════════════════
+function renderDashboard() {
+  renderDSubs()
+  renderDHistory()
+}
+
+function dashTab(id, el) {
+  document.getElementById('d-subs').style.display    = id==='subs'?'':'none'
+  document.getElementById('d-history').style.display = id==='history'?'':'none'
+  document.querySelectorAll('#page-dashboard .sidebar-item').forEach(s=>s.classList.remove('active'))
+  if(el) el.classList.add('active')
+}
+
+function renderDSubs() {
+  const el = document.getElementById('d-subs')
+  if(!el) return
+  const active = USER_SUBS.filter(s=>s.status!=='cancelled')
+  const spend  = active.reduce((a,s)=>a+s.price,0)
+  el.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:26px">
+      <div><h1 style="font-family:var(--font-d);font-weight:700;font-size:26px;letter-spacing:-.5px;margin-bottom:4px">My Subscriptions</h1><p style="font-size:13px;color:var(--text-1)">Manage your active plans on Arc</p></div>
+      <button class="btn-secondary" onclick="showPage('browse')">+ Find Plans</button>
+    </div>
+    <div class="stats-row" style="grid-template-columns:repeat(3,1fr);margin-bottom:24px">
+      ${statCard('Active Plans',String(active.length),'','','linear-gradient(90deg,transparent,var(--cyan),transparent)','var(--cyan)')}
+      ${statCard('Monthly Spend','$'+spend.toFixed(2),'','','linear-gradient(90deg,transparent,var(--gold),transparent)','var(--gold)')}
+      ${statCard('USDC Balance', fmtBalance(STATE.balance), 'Live · updates every 10s','','linear-gradient(90deg,transparent,var(--green),transparent)','var(--green)')}
+    </div>
+    <div style="display:flex;flex-direction:column;gap:16px">
+    ${USER_SUBS.map(sub => {
+      const plan = PLANS.find(p=>p.id===sub.planId)
+      const color = plan?.color || 'var(--cyan)'
+      const isPaused = sub.status==='paused'
+      const isCancelled = sub.status==='cancelled'
+      return `
+      <div style="background:var(--bg-1);border:1px solid ${isPaused?'rgba(240,184,64,.3)':'var(--border)'};border-radius:var(--r-lg);padding:24px;transition:border-color .2s;opacity:${isCancelled?.6:1}">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:18px">
+          <div>
+            <div style="font-family:var(--font-d);font-weight:600;font-size:17px;margin-bottom:4px">${sub.planName}</div>
+            <div style="font-family:var(--font-m);font-size:11px;color:var(--text-2)">Plan #${sub.planId} · Sub #${sub.id} · by ${sub.merchant}</div>
+          </div>
+          <span class="badge badge-${sub.status}">${sub.status}</span>
+        </div>
+        <div class="sub-timeline">
+          ${[
+            ['Amount',`$${sub.price} ${sub.token}`,color],
+            ['Interval',sub.interval,'var(--text-0)'],
+            ['Started',sub.start,'var(--text-0)'],
+            ['Next Payment',sub.next,isPaused?'var(--gold)':'var(--text-0)'],
+            ['Payments',String(sub.payments),'var(--green)'],
+          ].map(([l,v,c])=>`<div class="sub-tl-item"><div class="sub-tl-label">${l}</div><div class="sub-tl-val" style="color:${c}">${v}</div></div>`).join('')}
+        </div>
+        ${!isCancelled?`<div style="display:flex;gap:8px">
+          ${isPaused?`<button class="btn-primary" style="font-size:12px" onclick="openChargeModal(${sub.id})">Retry Payment →</button>`:`<button class="btn-ghost" style="font-size:12px" onclick="openChargeModal(${sub.id})">Charge Next Cycle</button>`}
+          <button class="btn-danger" style="font-size:12px" onclick="openChargeModal(${sub.id})">Cancel</button>
+        </div>`:'<div style="font-family:var(--font-m);font-size:11px;color:var(--text-2)">This subscription was cancelled.</div>'}
+      </div>`}).join('')}
+    </div>`
+}
+
+function renderDHistory() {
+  const el = document.getElementById('d-history')
+  if(!el) return
+  el.innerHTML = `
+    <div style="margin-bottom:26px"><h1 style="font-family:var(--font-d);font-weight:700;font-size:26px;letter-spacing:-.5px;margin-bottom:4px">Payment History</h1><p style="font-size:13px;color:var(--text-1)">All your on-chain transactions</p></div>
+    <div class="card">
+      <div class="card-header"><span class="card-title">Transactions</span><span style="font-family:var(--font-m);font-size:12px;color:var(--text-2)">${PAYMENT_HISTORY.length} total</span></div>
+      <div style="padding:8px 20px">
+        ${PAYMENT_HISTORY.map(h=>`
+          <div style="display:flex;align-items:center;padding:13px 0;border-bottom:1px solid var(--border);gap:13px">
+            <div style="width:34px;height:34px;border-radius:50%;background:${h.status==='success'?'var(--green-dim)':'var(--red-dim)'};display:flex;align-items:center;justify-content:center;font-size:13px;color:${h.status==='success'?'var(--green)':'var(--red)'};flex-shrink:0">${h.status==='success'?'✓':'✗'}</div>
+            <div style="flex:1;min-width:0">
+              <div style="font-size:13px;font-weight:500;margin-bottom:3px">${h.plan}</div>
+              <div style="font-family:var(--font-m);font-size:11px;color:var(--text-2)">${h.date} · ${h.merchant} ${h.tx!=='—'?`· <span style="color:var(--cyan)">${h.tx}</span>`:''}</div>
+            </div>
+            <div style="font-family:var(--font-m);font-size:13px;font-weight:500;color:${h.status==='success'?'var(--green)':'var(--red)'};flex-shrink:0">${h.status==='success'?'-':''}${h.amount} USDC${h.status==='failed'?'<span style="display:block;font-size:9px;font-weight:400">(FAILED)</span>':''}</div>
+          </div>`).join('')}
+      </div>
+    </div>`
+}
+
+// ══════════════════════════════════════════════
+// MODAL HELPERS
+// ══════════════════════════════════════════════
+function closeModal(id) {
+  document.getElementById(id).style.display = 'none'
+}
+
+// ══════════════════════════════════════════════
+// TOASTS
+// ══════════════════════════════════════════════
+let toastTimer = {}
+function toast(title, sub, icon='✓') {
+  const wrap = document.getElementById('toast-wrap')
+  const id   = 't_' + Date.now()
+  const el   = document.createElement('div')
+  el.id = id
+  el.className = 'toast'
+  const iconColor = icon==='✅'?'var(--green)':icon==='🔴'?'var(--red)':'var(--cyan)'
+  el.innerHTML = `
+    <span class="toast-icon" style="color:${iconColor}">${icon}</span>
+    <div style="flex:1"><div class="toast-title">${title}</div><div class="toast-sub">${sub}</div></div>
+    <button class="toast-x" onclick="document.getElementById('${id}').remove()">×</button>`
+  wrap.appendChild(el)
+  toastTimer[id] = setTimeout(() => { const t=document.getElementById(id); if(t) t.remove() }, 5000)
+  // max 4 toasts
+  while(wrap.children.length > 4) wrap.removeChild(wrap.firstChild)
+}
+
+// ══════════════════════════════════════════════
+// KEYBOARD
+// ══════════════════════════════════════════════
+document.addEventListener('keydown', e => {
+  if (e.key==='Escape') {
+    ['modal-subscribe','modal-create','modal-charge'].forEach(closeModal)
+    closeWalletModal()
+  }
 })
 
-app.get('/api/plans', apiAuth, async (req, res) => {
-  const m = (req as any).merchant
-  const { rows } = await db.query(
-    `SELECT * FROM plans WHERE merchant_id=$1 ORDER BY created_at DESC`, [m.id]
-  )
-  res.json({ plans: rows })
-})
+// ══════════════════════════════════════════════
+// INIT
+// ══════════════════════════════════════════════
+showPage('landing')
 
-app.patch('/api/plans/:id', apiAuth, async (req, res) => {
-  const m = (req as any).merchant
-  const { price, grace_period_sec, pause_allowed, is_active } = req.body
-  const { rows } = await db.query(
-    `UPDATE plans SET price=COALESCE($1,price), grace_period_sec=COALESCE($2,grace_period_sec),
-     pause_allowed=COALESCE($3,pause_allowed), is_active=COALESCE($4,is_active)
-     WHERE id=$5 AND merchant_id=$6 RETURNING *`,
-    [price, grace_period_sec, pause_allowed, is_active, req.params.id, m.id]
-  )
-  rows.length ? res.json({ plan: rows[0] }) : res.status(404).json({ error: 'Plan not found' })
-})
 
-// ── Subscriptions ─────────────────────────────────────────────
-app.get('/api/subscribers/:wallet/status', apiAuth, async (req, res) => {
-  const { rows } = await db.query(
-    `SELECT s.*, p.name AS plan_name
-     FROM subscriptions s
-     JOIN plans p ON s.plan_id = p.id
-     WHERE s.subscriber_wallet = $1
-       AND s.merchant_id = $2
-       AND s.status NOT IN ('cancelled','expired')`,
-    [req.params.wallet, (req as any).merchant.id]
-  )
-  res.json({ subscriptions: rows })
-})
 
-app.get('/api/subscriptions/:id', apiAuth, async (req, res) => {
-  const { rows } = await db.query(
-    `SELECT s.*, p.name AS plan_name
-     FROM subscriptions s
-     JOIN plans p ON s.plan_id = p.id
-     WHERE s.id=$1 AND s.merchant_id=$2`,
-    [req.params.id, (req as any).merchant.id]
-  )
-  rows.length ? res.json({ subscription: rows[0] }) : res.status(404).json({ error: 'Not found' })
-})
 
-app.get('/api/subscriptions/:id/history', apiAuth, async (req, res) => {
-  const { rows } = await db.query(
-    `SELECT * FROM payment_events
-     WHERE subscription_id=$1
-     ORDER BY created_at DESC LIMIT 50`,
-    [req.params.id]
-  )
-  res.json({ history: rows })
-})
+// ═══════════════════════════════════════════════════════════
+// V2 — Extended tab routing
+// ═══════════════════════════════════════════════════════════
 
-// ── Coupons ───────────────────────────────────────────────────
-app.post('/api/coupons', apiAuth, async (req, res) => {
-  const m = (req as any).merchant
-  const { code, discount_bps, fixed_discount, trial_ext_days,
-          expires_at, max_uses, plan_id } = req.body
-  const { rows } = await db.query(
-    `INSERT INTO coupons
-       (code, merchant_id, discount_bps, fixed_discount, trial_ext_days,
-        expires_at, max_uses, plan_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-     RETURNING *`,
-    [code, m.id, discount_bps||0, fixed_discount||0, trial_ext_days||0,
-     expires_at||null, max_uses||0, plan_id||null]
-  )
-  res.json({ coupon: rows[0] })
-})
+function dashTab(id, el) {
+  ['d-subs','d-history','d-usage','d-notif','d-wallet','d-referral'].forEach(function(t){
+    var e = document.getElementById(t); if(e) e.style.display='none';
+  });
+  var target = document.getElementById('d-'+id);
+  if(target) target.style.display='';
+  document.querySelectorAll('#page-dashboard .sidebar-item').forEach(function(s){s.classList.remove('active');});
+  if(el) el.classList.add('active');
+  if(id==='subs')     renderDSubs();
+  if(id==='history')  renderDHistory();
+  if(id==='usage')    renderUsageTab();
+  if(id==='notif')    renderNotificationsTab();
+  if(id==='wallet')   renderWalletSettingsTab();
+  if(id==='referral') renderReferralTab();
+}
 
-app.get('/api/coupons/validate/:code', async (req, res) => {
-  const { rows } = await db.query(
-    `SELECT * FROM coupons
-     WHERE code=$1
-       AND is_active=true
-       AND (expires_at IS NULL OR expires_at > NOW())
-       AND (max_uses = 0 OR used_count < max_uses)`,
-    [req.params.code]
-  )
-  rows.length
-    ? res.json({ valid: true, coupon: rows[0] })
-    : res.json({ valid: false, reason: 'Invalid or expired coupon' })
-})
+function merchantTab(id, el) {
+  ['m-overview','m-plans','m-subscribers','m-revenue','m-coupons','m-referrals','m-payouts','m-settings'].forEach(function(t){
+    var e = document.getElementById(t); if(e) e.style.display='none';
+  });
+  var target = document.getElementById('m-'+id);
+  if(target) target.style.display='';
+  document.querySelectorAll('#page-merchant .sidebar-item').forEach(function(s){s.classList.remove('active');});
+  if(el) el.classList.add('active');
+  if(id==='overview')    renderMOverview();
+  if(id==='plans')       renderMPlans();
+  if(id==='subscribers') renderMSubscribers();
+  if(id==='revenue')     renderMRevenueV2();
+  if(id==='coupons')     renderMCoupons();
+  if(id==='referrals')   renderMReferrals();
+  if(id==='payouts')     renderMPayouts();
+  if(id==='settings')    renderMSettings();
+}
 
-// ── Usage metering ────────────────────────────────────────────
-app.post('/api/usage', apiAuth, async (req, res) => {
-  const { subscription_id, usage_type, usage_units, price_per_unit } = req.body
-  const period = new Date().toISOString().slice(0, 7)
-  const total  = (usage_units * price_per_unit).toFixed(18)
+// ── Pause / Resume ────────────────────────────────────────────
+function pauseSubDemo(subId) {
+  var sub = USER_SUBS.find(function(s){return s.id===subId;});
+  if(!sub) return;
+  sub.status = 'paused';
+  sub.pausedAt = new Date().toISOString();
+  toast('Paused', sub.planName+' paused — access retained until next billing date', '⏸');
+  renderDSubs();
+}
 
-  const { rows } = await db.query(
-    `INSERT INTO usage_records
-       (subscription_id, billing_period, usage_type, usage_units, price_per_unit, total_charge)
-     VALUES ($1,$2,$3,$4,$5,$6)
-     ON CONFLICT DO NOTHING RETURNING *`,
-    [subscription_id, period, usage_type, usage_units, price_per_unit, total]
-  )
-  res.json({ record: rows[0] })
-})
+function resumeSubDemo(subId) {
+  var sub = USER_SUBS.find(function(s){return s.id===subId;});
+  if(!sub) return;
+  sub.status = 'active';
+  sub.pausedAt = null;
+  sub.next = nextPaymentLabel(sub.interval);
+  toast('Resumed', sub.planName+' resumed — next billing: '+sub.next, '▶');
+  renderDSubs();
+}
 
-app.get('/api/usage/:subId', apiAuth, async (req, res) => {
-  const { rows } = await db.query(
-    `SELECT * FROM usage_records WHERE subscription_id=$1 ORDER BY created_at DESC`,
-    [req.params.subId]
-  )
-  res.json({ records: rows })
-})
+// ── Coupon validation ─────────────────────────────────────────
+function validateCoupon() {
+  var code   = (document.getElementById('coupon-field')||{value:''}).value.trim().toUpperCase();
+  var status = document.getElementById('coupon-status');
+  if(!code || !status) return;
+  var coupon = DEMO_COUPONS.find(function(c){return c.code===code;});
+  if(!coupon) {
+    status.innerHTML = '<div class="coupon-err">&#10007; Invalid or expired coupon code</div>';
+    STATE.couponValid = null;
+    return;
+  }
+  STATE.couponValid = coupon;
+  var desc = coupon.type==='percent' ? coupon.discount+'% off' :
+             coupon.type==='fixed'   ? '$'+coupon.discount+' off' :
+             '+'+coupon.trialExt+' days trial';
+  status.innerHTML = '<div class="coupon-ok">&#10003; Applied: '+desc+' ('+coupon.uses+'/'+(coupon.maxUses||'&#8734;')+' uses)</div>';
+  toast('Coupon applied!', desc, '&#127999;');
+}
 
-// ── Analytics ─────────────────────────────────────────────────
-app.get('/api/analytics', apiAuth, async (req, res) => {
-  const m      = (req as any).merchant
-  const period = (req.query.period as string) || new Date().toISOString().slice(0, 7)
-  const { rows } = await db.query(
-    `SELECT * FROM merchant_analytics
-     WHERE merchant_wallet=$1 AND period=$2`,
-    [m.wallet_address, period]
-  )
-  // Also fetch plan breakdown
-  const { rows: plans } = await db.query(
-    `SELECT p.name, COUNT(s.id) AS subscribers,
-            SUM(CASE WHEN s.status='active' THEN s.amount ELSE 0 END) AS mrr
-     FROM subscriptions s
-     JOIN plans p ON s.plan_id = p.id
-     WHERE s.merchant_wallet=$1
-     GROUP BY p.name`,
-    [m.wallet_address]
-  )
-  res.json({ analytics: rows[0] || {}, planBreakdown: plans })
-})
+// ── Extended renderDSubs with V2 badges ───────────────────────
+function renderDSubs() {
+  var el = document.getElementById('d-subs');
+  if(!el) return;
+  var active = USER_SUBS.filter(function(s){return s.status!=='cancelled';});
+  var spend  = active.reduce(function(a,s){return a+s.price;}, 0);
 
-// ── Referrals ─────────────────────────────────────────────────
-app.get('/api/referrals', apiAuth, async (req, res) => {
-  const m = (req as any).merchant
-  const { rows } = await db.query(
-    `SELECT r.*, s.subscriber_wallet
-     FROM referral_events r
-     JOIN subscriptions s ON r.subscription_id = s.id
-     WHERE s.merchant_wallet=$1
-     ORDER BY r.created_at DESC`,
-    [m.wallet_address]
-  )
-  res.json({ referrals: rows })
-})
+  var statsHtml = '<div class="stats-row" style="grid-template-columns:repeat(4,1fr);margin-bottom:24px">'
+    + statCard('Active Plans',    String(active.filter(function(s){return s.status==='active';}).length), '', '', 'linear-gradient(90deg,transparent,var(--cyan),transparent)', 'var(--cyan)')
+    + statCard('Monthly Spend',   '$'+spend.toFixed(2), '', '', 'linear-gradient(90deg,transparent,var(--gold),transparent)', 'var(--gold)')
+    + statCard('USDC Balance',    fmtBalance(STATE.balance), 'Live', '', 'linear-gradient(90deg,transparent,var(--green),transparent)', 'var(--green)')
+    + statCard('Notifications',   String(DEMO_NOTIFICATIONS.filter(function(n){return !n.read;}).length)+' unread', '', '', 'linear-gradient(90deg,transparent,var(--red),transparent)', 'var(--red)')
+    + '</div>';
 
-// ── Notifications ─────────────────────────────────────────────
-app.get('/api/notifications/:wallet', async (req, res) => {
-  const { rows } = await db.query(
-    `SELECT * FROM notifications
-     WHERE recipient_wallet=$1
-     ORDER BY created_at DESC LIMIT 50`,
-    [req.params.wallet]
-  )
-  res.json({ notifications: rows })
-})
+  var cards = USER_SUBS.map(function(sub) {
+    var plan        = PLANS.find(function(p){return p.id===sub.planId;});
+    var color       = plan ? plan.color : 'var(--cyan)';
+    var isCancelled = sub.status==='cancelled';
+    var isOverdue   = sub.status==='overdue';
+    var isPaused    = sub.status==='paused';
+    var badgeMap    = {active:'badge-active',paused:'badge-paused',overdue:'badge-overdue',suspended:'badge-suspended',cancelled:'badge-cancelled'};
+    var badgeCls    = badgeMap[sub.status] || 'badge-inactive';
 
-app.patch('/api/notifications/:id/read', async (req, res) => {
-  await db.query(
-    `UPDATE notifications SET read_at=NOW() WHERE id=$1`, [req.params.id]
-  )
-  res.json({ ok: true })
-})
+    var retryHtml  = sub.retryCount > 0
+      ? '<div class="retry-bar">&#9201; <div><strong>Retry '+sub.retryCount+'/3 scheduled</strong> &mdash; Next attempt: '+sub.nextRetryAt+'</div></div>'
+      : '';
+    var graceHtml  = sub.gracePeriodEnd
+      ? '<div class="grace-bar">&#9888;&#65039; <div><strong>Grace period active</strong> &mdash; Suspends after '+sub.gracePeriodEnd+'</div></div>'
+      : '';
+    var usageHtml  = sub.usageThisMonth > 0
+      ? '<div style="background:var(--cyan-dim);border:1px solid rgba(56,200,240,.2);border-radius:var(--r-md);padding:10px 14px;margin-bottom:14px;font-size:12px;color:var(--cyan);display:flex;justify-content:space-between"><span>&#128202; Usage: '+sub.usageThisMonth+' API calls</span><span>+$'+(sub.usageThisMonth*sub.usagePricePerUnit).toFixed(2)+' USDC</span></div>'
+      : '';
 
-// ─────────────────────────────────────────────────────────────
-//  CRON JOBS
-// ─────────────────────────────────────────────────────────────
-// Every minute: process due payments
-cron.schedule('* * * * *', async () => {
-  try { await processDuePayments()  } catch(e) { console.error('[cron] billing:', e) }
-})
+    var tlItems = [
+      ['Amount',   '$'+sub.price+' '+sub.token, color],
+      ['Interval', sub.interval,                'var(--text-0)'],
+      ['Started',  sub.start,                   'var(--text-0)'],
+      ['Next',     sub.next,                    isOverdue?'var(--gold)':'var(--text-0)'],
+      ['Payments', String(sub.payments),         'var(--green)']
+    ];
+    var tlHtml = tlItems.map(function(item) {
+      return '<div class="sub-tl-item"><div class="sub-tl-label">'+item[0]+'</div><div class="sub-tl-val" style="color:'+item[2]+'">'+item[1]+'</div></div>';
+    }).join('');
 
-// Every 5 minutes: process retries
-cron.schedule('*/5 * * * *', async () => {
-  try { await processRetries()      } catch(e) { console.error('[cron] retries:', e) }
-})
+    var btnHtml = '';
+    if(!isCancelled) {
+      if(sub.status==='active')   btnHtml += '<button class="btn-ghost" style="font-size:12px" onclick="openChargeModal('+sub.id+')">Pay Next Cycle</button>';
+      if(isOverdue||isPaused)     btnHtml += '<button class="btn-primary" style="font-size:12px" onclick="openChargeModal('+sub.id+')">Retry Payment &rarr;</button>';
+      if(sub.status==='active')   btnHtml += '<button class="btn-ghost" style="font-size:12px" onclick="openChangePlanModal('+sub.id+')">&#128260; Change Plan</button>';
+      if(sub.status==='active')   btnHtml += '<button class="btn-ghost" style="font-size:12px" onclick="pauseSubDemo('+sub.id+')">&#9208; Pause</button>';
+      if(isPaused)                btnHtml += '<button class="btn-primary" style="font-size:12px" onclick="resumeSubDemo('+sub.id+')">&#9654; Resume</button>';
+      btnHtml += '<button class="btn-danger" style="font-size:12px" onclick="openChargeModal('+sub.id+')">Cancel</button>';
+    } else {
+      btnHtml = '<div style="font-family:var(--font-m);font-size:11px;color:var(--text-2)">Subscription cancelled.</div>';
+    }
 
-// Every 10 minutes: check grace period expiry
-cron.schedule('*/10 * * * *', async () => {
-  try { await processGraceExpiry()  } catch(e) { console.error('[cron] grace:', e) }
-})
+    return '<div style="background:var(--bg-1);border:1px solid '+(isOverdue?'rgba(240,184,64,.3)':isPaused?'var(--border-hi)':'var(--border)')+';border-radius:var(--r-lg);padding:24px;opacity:'+(isCancelled?'.6':'1')+'">'
+      + '<div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:14px">'
+      + '<div><div style="font-family:var(--font-d);font-weight:600;font-size:17px;margin-bottom:3px">'+sub.planName+'</div>'
+      + '<div style="font-family:var(--font-m);font-size:11px;color:var(--text-2)">Sub #'+sub.id+' &middot; '+sub.merchant+'</div></div>'
+      + '<span class="badge '+badgeCls+'">'+sub.status+'</span></div>'
+      + retryHtml + graceHtml + usageHtml
+      + '<div class="sub-timeline">'+tlHtml+'</div>'
+      + '<div style="display:flex;gap:8px;flex-wrap:wrap">'+btnHtml+'</div>'
+      + '</div>';
+  }).join('');
 
-// Daily at 09:00 UTC: trial reminders
-cron.schedule('0 9 * * *', async () => {
-  try { await procesTrialReminders()} catch(e) { console.error('[cron] trials:', e) }
-})
+  el.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:26px">'
+    + '<div><h1 style="font-family:var(--font-d);font-weight:700;font-size:26px;letter-spacing:-.5px;margin-bottom:4px">My Subscriptions</h1>'
+    + '<p style="font-size:13px;color:var(--text-1)">Manage your plans on Arc</p></div>'
+    + '<button class="btn-secondary" onclick="showPage(\'browse\')">+ Find Plans</button></div>'
+    + statsHtml
+    + '<div style="display:flex;flex-direction:column;gap:16px">'+cards+'</div>';
+}
 
-// ─────────────────────────────────────────────────────────────
-//  UTILS
-// ─────────────────────────────────────────────────────────────
-function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)) }
+// ── Usage tab ─────────────────────────────────────────────────
+function renderUsageTab() {
+  var el = document.getElementById('d-usage');
+  if(!el) return;
+  var total = DEMO_USAGE.reduce(function(a,u){return a+u.total;}, 0);
+  var rows = DEMO_USAGE.map(function(u) {
+    var pct = Math.min(100, (u.units/200)*100);
+    return '<div style="display:flex;align-items:center;padding:14px 0;border-bottom:1px solid var(--border);gap:16px">'
+      + '<div style="flex:1">'
+      + '<div style="font-size:13px;font-weight:500;margin-bottom:3px">'+u.sub+' &mdash; '+u.type+'</div>'
+      + '<div style="font-family:var(--font-m);font-size:11px;color:var(--text-2)">'+u.units.toLocaleString()+' units &times; $'+u.price+'/unit</div>'
+      + '<div style="margin-top:8px;display:flex;align-items:center;gap:8px">'
+      + '<div class="usage-bar-wrap"><div class="usage-bar-fill" style="width:'+pct+'%"></div></div>'
+      + '<span style="font-family:var(--font-m);font-size:10px;color:var(--text-2)">'+u.units+'</span></div></div>'
+      + '<div style="font-family:var(--font-m);font-size:14px;color:var(--gold);flex-shrink:0">+$'+u.total.toFixed(2)+'</div></div>';
+  }).join('');
+  el.innerHTML = '<div style="margin-bottom:26px"><h1 style="font-family:var(--font-d);font-weight:700;font-size:26px;letter-spacing:-.5px;margin-bottom:4px">Usage Details</h1>'
+    + '<p style="font-size:13px;color:var(--text-1)">Metered billing breakdown &mdash; Apr 2026</p></div>'
+    + '<div class="card"><div class="card-header"><span class="card-title">Usage Records</span>'
+    + '<span style="font-family:var(--font-m);font-size:12px;color:var(--text-2)">Apr 2026</span></div>'
+    + '<div style="padding:8px 20px">'+rows
+    + '<div style="display:flex;justify-content:space-between;padding:14px 0;font-family:var(--font-m);font-size:14px;font-weight:500;color:var(--cyan)">'
+    + '<span>Total Usage Charges</span><span>+$'+total.toFixed(2)+' USDC</span></div></div></div>';
+}
 
-// ─────────────────────────────────────────────────────────────
-//  SERVER
-// ─────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 4000
-app.listen(PORT, () => console.log(`ArcSub V2 billing service on :${PORT}`))
+// ── Notifications tab ─────────────────────────────────────────
+function renderNotificationsTab() {
+  var el = document.getElementById('d-notif');
+  if(!el) return;
+  var iconMap = {retry_scheduled:'&#9201;', grace_period:'&#9888;&#65039;', payment_success:'&#9989;', trial_ending:'&#128276;', payment_failed:'&#10060;'};
+  var items = DEMO_NOTIFICATIONS.map(function(n, i) {
+    var icon = iconMap[n.type] || '&middot;';
+    return '<div class="'+(n.read?'':'notif-unread')+'" style="display:flex;align-items:flex-start;gap:12px;padding:14px 0;border-bottom:1px solid var(--border)">'
+      + (!n.read ? '<div class="notif-dot"></div>' : '<div style="width:7px;flex-shrink:0"></div>')
+      + '<div style="flex:1">'
+      + '<div style="font-size:13px;font-weight:'+(n.read?400:600)+';margin-bottom:3px">'+icon+' '+n.msg+'</div>'
+      + '<div style="font-family:var(--font-m);font-size:11px;color:var(--text-2)">'+n.date+'</div></div>'
+      + (!n.read ? '<button class="btn-ghost" style="font-size:10px;padding:3px 8px" onclick="DEMO_NOTIFICATIONS['+i+'].read=true;renderNotificationsTab()">Dismiss</button>' : '')
+      + '</div>';
+  }).join('');
+  el.innerHTML = '<div style="margin-bottom:26px"><h1 style="font-family:var(--font-d);font-weight:700;font-size:26px;letter-spacing:-.5px;margin-bottom:4px">Notifications</h1></div>'
+    + '<div class="card"><div class="card-header"><span class="card-title">All Notifications</span>'
+    + '<button class="btn-ghost" style="font-size:11px" onclick="DEMO_NOTIFICATIONS.forEach(function(n){n.read=true;});var b=document.getElementById(\'notif-badge\');if(b)b.textContent=\'0\';renderNotificationsTab()">Mark all read</button></div>'
+    + '<div style="padding:8px 20px">'+items+'</div></div>';
+}
 
-export { app, db }
+// ── Wallet Settings tab ───────────────────────────────────────
+function renderWalletSettingsTab() {
+  var el = document.getElementById('d-wallet');
+  if(!el) return;
+  var addrDisplay = STATE.connected ? STATE.address.slice(0,10)+'&hellip;'+STATE.address.slice(-6) : 'Not connected';
+  var backupSection = STATE.backupWallet
+    ? '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;padding:12px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--r-md)">'
+      + '<span class="addr-chip">'+STATE.backupWallet+'</span>'
+      + '<button class="btn-danger" style="font-size:11px" onclick="STATE.backupWallet=\'\';renderWalletSettingsTab();toast(\'Removed\',\'Backup wallet removed\',\'&#128308;\')">Remove</button></div>'
+    : '<p style="font-size:13px;color:var(--text-1);margin-bottom:14px">No backup wallet set. Add one to prevent subscription interruptions.</p>';
+  el.innerHTML = '<div style="margin-bottom:26px"><h1 style="font-family:var(--font-d);font-weight:700;font-size:26px;letter-spacing:-.5px;margin-bottom:4px">Wallet Settings</h1>'
+    + '<p style="font-size:13px;color:var(--text-1)">Manage primary and backup wallets</p></div>'
+    + '<div class="card" style="max-width:560px;margin-bottom:16px"><div class="card-header"><span class="card-title">Primary Wallet</span></div>'
+    + '<div style="padding:18px 22px">'
+    + '<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border);font-size:13px"><span style="color:var(--text-1)">Connected</span><span class="addr-chip">'+addrDisplay+'</span></div>'
+    + '<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;font-size:13px"><span style="color:var(--text-1)">Balance</span><span style="font-family:var(--font-m);color:var(--green)">'+fmtBalance(STATE.balance)+'</span></div>'
+    + '</div></div>'
+    + '<div class="card" style="max-width:560px"><div class="card-header"><span class="card-title">Backup Wallet</span>'
+    + '<span style="font-size:11px;color:var(--text-1)">Used if primary has insufficient balance</span></div>'
+    + '<div style="padding:18px 22px">'+backupSection
+    + '<div style="display:flex;gap:8px"><input class="input" id="backup-wallet-input" placeholder="0x&hellip; backup wallet address">'
+    + '<button class="btn-primary" style="flex-shrink:0" onclick="setBackupWalletDemo()">Set Backup</button></div></div></div>';
+}
+
+function setBackupWalletDemo() {
+  var val = (document.getElementById('backup-wallet-input')||{value:''}).value.trim();
+  if(!val || val.length !== 42) { toast('Invalid','Enter a valid 42-char wallet address','&#9888;&#65039;'); return; }
+  STATE.backupWallet = val;
+  toast('Backup set', val.slice(0,10)+'&hellip; added as backup wallet', '&#128272;');
+  renderWalletSettingsTab();
+}
+
+// ── Referral tab (user) ───────────────────────────────────────
+function renderReferralTab() {
+  var el = document.getElementById('d-referral');
+  if(!el) return;
+  var code    = STATE.address ? STATE.address.slice(2,10) : 'YOURCODE';
+  var refLink = 'https://arcsub.app/ref/'+code;
+  var rows = DEMO_REFERRALS.map(function(r) {
+    return '<tr><td class="td-mono">'+r.wallet+'</td><td>'+r.plan+'</td>'
+      + '<td class="td-mono" style="color:var(--gold)">+$'+r.earned+' USDC</td>'
+      + '<td style="font-size:12px;color:var(--text-1)">'+r.date+'</td>'
+      + '<td><a href="https://testnet.arcscan.app/tx/'+r.tx+'" target="_blank" style="color:var(--cyan);font-family:var(--font-m);font-size:11px">'+r.tx+' &#8599;</a></td></tr>';
+  }).join('');
+  el.innerHTML = '<div style="margin-bottom:26px"><h1 style="font-family:var(--font-d);font-weight:700;font-size:26px;letter-spacing:-.5px;margin-bottom:4px">Referrals</h1>'
+    + '<p style="font-size:13px;color:var(--text-1)">Earn USDC for every subscriber you refer</p></div>'
+    + '<div class="stats-row" style="grid-template-columns:repeat(3,1fr);margin-bottom:24px">'
+    + statCard('Total Earned','$4.00','All time','','linear-gradient(90deg,transparent,var(--gold),transparent)','var(--gold)')
+    + statCard('Referrals','3','','','linear-gradient(90deg,transparent,var(--cyan),transparent)','var(--cyan)')
+    + statCard('Pending','$1.50','Unlocks next payment','','linear-gradient(90deg,transparent,var(--green),transparent)','var(--green)')
+    + '</div>'
+    + '<div class="card" style="margin-bottom:16px"><div class="card-header"><span class="card-title">Your Referral Link</span></div>'
+    + '<div style="padding:18px 22px"><p style="font-size:13px;color:var(--text-1);margin-bottom:12px">Share this link. Earn commission on every first payment.</p>'
+    + '<div class="referral-link-box" onclick="navigator.clipboard.writeText(\''+refLink+'\');toast(\'Copied!\',\'Referral link copied\',\'&#128203;\')">'
+    + '<span style="font-family:var(--font-m);font-size:11px">'+refLink+'</span>'
+    + '<span style="color:var(--text-2);font-size:11px">Click to copy</span></div></div></div>'
+    + '<div class="card"><div class="card-header"><span class="card-title">Referral History</span></div>'
+    + '<div style="overflow-x:auto"><table class="data-table"><thead><tr><th>Referred</th><th>Plan</th><th>Earned</th><th>Date</th><th>Tx</th></tr></thead>'
+    + '<tbody>'+rows+'</tbody></table></div></div>';
+}
+
+// ── Change Plan modal ─────────────────────────────────────────
+function openChangePlanModal(subId) {
+  var sub = USER_SUBS.find(function(s){return s.id===subId;});
+  if(!sub) return;
+  STATE.changePlanSub = subId;
+  var currentPlan = PLANS.find(function(p){return p.id===sub.planId;});
+  var others      = PLANS.filter(function(p){return p.id!==sub.planId && p.token===sub.token;});
+
+  var planCards = others.map(function(p) {
+    var isUpgrade    = p.price > (currentPlan ? currentPlan.price : 0);
+    var diff         = Math.abs(p.price - (currentPlan ? currentPlan.price : 0));
+    var proratedEst  = (diff * 15 / 30).toFixed(2);
+    return '<div class="plan-change-preview" onclick="confirmPlanChange('+p.id+')" style="cursor:pointer" '
+      + 'onmouseenter="this.style.borderColor=\'var(--border-hi)\'" onmouseleave="this.style.borderColor=\'var(--border)\'">'
+      + '<div class="plan-compare-row"><span style="color:var(--text-1)">Plan</span><span style="font-weight:500">'+p.name+'</span></div>'
+      + '<div class="plan-compare-row"><span style="color:var(--text-1)">Price</span><span style="font-family:var(--font-m);color:var(--cyan)">$'+p.price+'/'+p.interval.toLowerCase()+'</span></div>'
+      + '<div class="plan-compare-row"><span style="color:var(--text-1)">Type</span><span class="badge '+(isUpgrade?'badge-active':'badge-paused')+'">'+(isUpgrade?'UPGRADE':'DOWNGRADE')+'</span></div>'
+      + '<div class="plan-compare-row"><span style="color:var(--text-1)">'+(isUpgrade?'Charge today':'Effective')+'</span>'
+      + '<span style="font-family:var(--font-m);font-size:12px;color:'+(isUpgrade?'var(--red)':'var(--green)')+'">'+( isUpgrade ? '~$'+proratedEst+' USDC (prorated)' : 'Next billing cycle')+'</span></div></div>';
+  }).join('');
+
+  var inner = '<div style="padding:24px 28px 0;display:flex;justify-content:space-between;align-items:flex-start">'
+    + '<div><div style="font-family:var(--font-d);font-weight:700;font-size:20px;letter-spacing:-.5px">Change Plan</div>'
+    + '<div style="font-family:var(--font-m);font-size:11px;color:var(--text-2);margin-top:3px">Current: '+sub.planName+' &middot; $'+sub.price+'/mo</div></div>'
+    + '<button class="modal-close" onclick="closeModal(\'modal-change-plan\')">&#215;</button></div>'
+    + '<div style="padding:20px 28px 28px">'
+    + '<div class="notice gold">Upgrades apply immediately with prorated charge. Downgrades take effect at next billing cycle.</div>'
+    + planCards
+    + '<div style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px">'
+    + '<button class="btn-ghost" onclick="closeModal(\'modal-change-plan\')">Cancel</button></div></div>';
+
+  var modal = document.getElementById('modal-change-plan');
+  if(!modal) {
+    modal = document.createElement('div');
+    modal.id = 'modal-change-plan';
+    modal.style.display = 'none';
+    modal.innerHTML = '<div class="modal-overlay" onclick="if(event.target===this)closeModal(\'modal-change-plan\')"><div class="modal" style="max-width:480px" id="change-plan-inner"></div></div>';
+    document.getElementById('app').appendChild(modal);
+  }
+  document.getElementById('change-plan-inner').innerHTML = inner;
+  modal.style.display = '';
+}
+
+function confirmPlanChange(newPlanId) {
+  var subId   = STATE.changePlanSub;
+  var sub     = USER_SUBS.find(function(s){return s.id===subId;});
+  var newPlan = PLANS.find(function(p){return p.id===newPlanId;});
+  if(!sub || !newPlan) return;
+  var isUpgrade = newPlan.price > sub.price;
+  closeModal('modal-change-plan');
+  sub.planId   = newPlanId;
+  sub.planName = newPlan.name;
+  sub.price    = newPlan.price;
+  sub.interval = newPlan.interval;
+  toast(isUpgrade ? 'Plan upgraded!' : 'Downgrade scheduled',
+        isUpgrade ? 'Now on '+newPlan.name : newPlan.name+' takes effect next cycle',
+        isUpgrade ? '&#128316;' : '&#128317;');
+  renderDSubs();
+}
+
+// ── Merchant Coupons tab ──────────────────────────────────────
+function renderMCoupons() {
+  var el = document.getElementById('m-coupons');
+  if(!el) return;
+  var rows = DEMO_COUPONS.map(function(c) {
+    var discount = c.type==='percent' ? c.discount+'%' : c.type==='fixed' ? '$'+c.discount : '+'+c.trialExt+'d trial';
+    return '<tr><td><code style="font-family:var(--font-m);color:var(--cyan);font-size:12px">'+c.code+'</code></td>'
+      + '<td style="font-size:12px">'+c.type+'</td><td class="td-mono">'+discount+'</td>'
+      + '<td class="td-mono">'+c.uses+'/'+(c.maxUses||'&#8734;')+'</td>'
+      + '<td style="font-size:12px;color:var(--text-1)">'+(c.expires||'Never')+'</td>'
+      + '<td><span class="badge badge-active">active</span></td></tr>';
+  }).join('');
+  el.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:26px">'
+    + '<div><h1 style="font-family:var(--font-d);font-weight:700;font-size:26px;letter-spacing:-.5px;margin-bottom:4px">Coupons &amp; Promo Codes</h1>'
+    + '<p style="font-size:13px;color:var(--text-1)">Create discount codes for your subscribers</p></div>'
+    + '<button class="btn-primary" onclick="toast(\'Create Coupon\',\'Connect to API in production\',\'&#127999;\')">+ Create Coupon</button></div>'
+    + '<div class="card"><div class="table-wrap"><table class="data-table"><thead><tr>'
+    + '<th>Code</th><th>Type</th><th>Discount</th><th>Uses</th><th>Expires</th><th>Status</th>'
+    + '</tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+}
+
+// ── Merchant Referrals tab ────────────────────────────────────
+function renderMReferrals() {
+  var el = document.getElementById('m-referrals');
+  if(!el) return;
+  var rows = DEMO_REFERRALS.map(function(r) {
+    return '<tr><td class="td-mono">'+r.wallet+'</td><td>'+r.plan+'</td>'
+      + '<td class="td-mono" style="color:var(--gold)">$'+r.earned+' USDC</td>'
+      + '<td style="font-size:12px;color:var(--text-1)">'+r.date+'</td>'
+      + '<td><a href="https://testnet.arcscan.app/tx/'+r.tx+'" target="_blank" style="color:var(--cyan);font-family:var(--font-m);font-size:11px">'+r.tx+' &#8599;</a></td></tr>';
+  }).join('');
+  el.innerHTML = '<div style="margin-bottom:26px"><h1 style="font-family:var(--font-d);font-weight:700;font-size:26px;letter-spacing:-.5px;margin-bottom:4px">Referral Program</h1>'
+    + '<p style="font-size:13px;color:var(--text-1)">Incentivise word-of-mouth growth</p></div>'
+    + '<div class="stats-row" style="grid-template-columns:repeat(3,1fr);margin-bottom:24px">'
+    + statCard('Total Referrals','3','','','linear-gradient(90deg,transparent,var(--cyan),transparent)','var(--cyan)')
+    + statCard('Commissions Paid','$4.00','USDC','','linear-gradient(90deg,transparent,var(--gold),transparent)','var(--gold)')
+    + statCard('Conv. Rate','33%','1 in 3 converts','','linear-gradient(90deg,transparent,var(--green),transparent)','var(--green)')
+    + '</div>'
+    + '<div class="card"><div class="card-header"><span class="card-title">Referral Events</span></div>'
+    + '<div class="table-wrap"><table class="data-table"><thead><tr><th>Referrer</th><th>Plan</th><th>Reward</th><th>Date</th><th>Tx</th></tr></thead>'
+    + '<tbody>'+rows+'</tbody></table></div></div>';
+}
+
+// ── Merchant Payouts tab ──────────────────────────────────────
+function renderMPayouts() {
+  var el = document.getElementById('m-payouts');
+  if(!el) return;
+  var DEMO_PAYOUTS = [
+    {date:'Apr 1, 2026',  sub:'0x1a2b&hellip;', plan:'Premium Newsletter', gross:10,  merch:9.50,   plat:0.50,  aff:0,    tx:'0xabc&hellip;'},
+    {date:'Apr 1, 2026',  sub:'0x2b3c&hellip;', plan:'SaaS Builder Pro',   gross:25,  merch:23.75,  plat:1.25,  aff:0,    tx:'0xdef&hellip;'},
+    {date:'Apr 6, 2026',  sub:'0x3c4d&hellip;', plan:'Membership Pass',    gross:5,   merch:4.50,   plat:0.25,  aff:0.25, tx:'0xghi&hellip;'},
+    {date:'Apr 13, 2026', sub:'0x4d5e&hellip;', plan:'Research Vault',     gross:199, merch:189.05, plat:9.95,  aff:0,    tx:'0xjkl&hellip;'},
+  ];
+  var rows = DEMO_PAYOUTS.map(function(p) {
+    return '<tr><td style="font-size:12px;color:var(--text-1)">'+p.date+'</td>'
+      + '<td class="td-mono">'+p.sub+'</td><td style="font-size:12px">'+p.plan+'</td>'
+      + '<td class="td-mono">$'+p.gross+'</td>'
+      + '<td class="td-mono" style="color:var(--green)">$'+p.merch+'</td>'
+      + '<td class="td-mono" style="color:var(--text-2)">$'+p.plat+'</td>'
+      + '<td><a href="https://testnet.arcscan.app/tx/'+p.tx+'" target="_blank" style="color:var(--cyan);font-family:var(--font-m);font-size:11px">'+p.tx+' &#8599;</a></td></tr>';
+  }).join('');
+  el.innerHTML = '<div style="margin-bottom:26px"><h1 style="font-family:var(--font-d);font-weight:700;font-size:26px;letter-spacing:-.5px;margin-bottom:4px">Payout History</h1>'
+    + '<p style="font-size:13px;color:var(--text-1)">Revenue split log &mdash; every payment on-chain</p></div>'
+    + '<div class="stats-row" style="grid-template-columns:repeat(3,1fr);margin-bottom:24px">'
+    + statCard('Your Share','$226.80','95% of gross','up','linear-gradient(90deg,transparent,var(--green),transparent)','var(--green)')
+    + statCard('Platform Fee','$11.95','2.5% avg','','linear-gradient(90deg,transparent,var(--text-2),transparent)','var(--text-2)')
+    + statCard('Affiliate','$0.25','Paid to partners','','linear-gradient(90deg,transparent,var(--purple),transparent)','var(--purple)')
+    + '</div>'
+    + '<div class="card"><div class="table-wrap"><table class="data-table"><thead><tr>'
+    + '<th>Date</th><th>Subscriber</th><th>Plan</th><th>Gross</th><th>You Got</th><th>Platform</th><th>Tx</th>'
+    + '</tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+}
+
+// ── Revenue V2 with forecast ──────────────────────────────────
+function renderMRevenueV2() {
+  renderMRevenue();  // run original first
+  var el = document.getElementById('m-revenue');
+  if(!el) return;
+  var FORECAST = [
+    {m:'Nov',v:320,proj:false},{m:'Dec',v:390,proj:false},{m:'Jan',v:540,proj:false},
+    {m:'Feb',v:620,proj:false},{m:'Mar',v:755,proj:false},{m:'Apr',v:847,proj:false},
+    {m:'May',v:920,proj:true}, {m:'Jun',v:1010,proj:true},{m:'Jul',v:1090,proj:true},
+  ];
+  var maxV = Math.max.apply(null, FORECAST.map(function(d){return d.v;}));
+  var bars = FORECAST.map(function(d) {
+    var h = ((d.v/maxV)*100).toFixed(1);
+    var bg = d.proj ? 'var(--purple)' : 'linear-gradient(180deg,var(--cyan),rgba(56,200,240,.3))';
+    var opacity = d.proj ? 'opacity:.45;' : '';
+    return '<div class="bar-wrap"><div style="flex:1;width:100%;display:flex;align-items:flex-end">'
+      + '<div style="width:100%;height:'+h+'%;min-height:4px;border-radius:4px 4px 0 0;background:'+bg+';'+opacity+'" title="'+d.m+': $'+d.v+(d.proj?' (projected)':'')+'"></div>'
+      + '</div><div class="bar-label">'+d.m+'</div></div>';
+  }).join('');
+  el.innerHTML += '<div class="card" style="margin-top:16px">'
+    + '<div class="card-header"><span class="card-title">Revenue Forecast &mdash; next 3 months</span>'
+    + '<span style="font-family:var(--font-m);font-size:11px;color:var(--text-2)">Dashed = projected</span></div>'
+    + '<div style="padding:22px"><div class="bar-chart">'+bars+'</div>'
+    + '<div style="display:flex;gap:16px;margin-top:12px;font-family:var(--font-m);font-size:11px;color:var(--text-2)">'
+    + '<span style="display:flex;align-items:center;gap:4px"><div style="width:10px;height:10px;background:var(--cyan);border-radius:2px"></div>Actual</span>'
+    + '<span style="display:flex;align-items:center;gap:4px"><div style="width:10px;height:10px;background:var(--purple);opacity:.45;border-radius:2px"></div>Projected</span>'
+    + '</div></div></div>';
+}
+
+// ── Override renderMerchant to pre-render V2 tabs ─────────────
+var _origRenderMerchant = renderMerchant;
+function renderMerchant() {
+  _origRenderMerchant();
+  renderMCoupons();
+  renderMReferrals();
+  renderMPayouts();
+}
+
+</script>
+</body>
+</html>
