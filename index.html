@@ -760,6 +760,21 @@ const REVENUE_DATA = [
 ]
 
 // ══════════════════════════════════════════════
+// ── Referral code generator ─────────────────────────────────
+// Generates a deterministic 7-char code (A-Z + 0-9) from a wallet address.
+// Same wallet always gets the same code. Looks like: A3X9KQ2
+function generateReferralCode(address) {
+  var chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no O/0/1/I to avoid confusion
+  var code  = '';
+  var addr  = address.replace('0x','').toLowerCase();
+  // Use pairs of hex chars as seeds for character selection
+  for(var i = 0; i < 7; i++) {
+    var pair  = parseInt(addr.slice(i*2, i*2+2), 16);
+    code += chars[pair % chars.length];
+  }
+  return code;
+}
+
 // ══════════════════════════════════════════════
 // EIP-6963 MULTI-WALLET PROVIDER REGISTRY
 // Each extension announces itself with its own
@@ -958,11 +973,12 @@ async function connectWallet(type) {
     // If alreadyOnArc === true: no popup shown, proceed directly to success
 
     // ── Success ────────────────────────────────────────────────────────────
-    STATE.connected = true
-    STATE.wallet    = type
-    STATE.address   = addr
-    STATE.provider  = provider
-    STATE.balance   = 0  // will be replaced by real on-chain value below
+    STATE.connected    = true
+    STATE.wallet       = type
+    STATE.address      = addr
+    STATE.provider     = provider
+    STATE.balance      = 0  // will be replaced by real on-chain value below
+    STATE.referralCode = generateReferralCode(addr)  // unique 7-char code for this wallet
 
     // Listen for account/chain changes
     provider.on('accountsChanged', accs => {
@@ -2216,30 +2232,66 @@ function setBackupWalletDemo() {
 function renderReferralTab() {
   var el = document.getElementById('d-referral');
   if(!el) return;
-  var code    = STATE.address ? STATE.address.slice(2,10) : 'YOURCODE';
-  var refLink = 'https://arcsub.app/ref/'+code;
+
+  // Use the stored referral code (generated from wallet address on connect)
+  // Falls back to a placeholder if not connected
+  var refCode = STATE.referralCode || (STATE.address ? generateReferralCode(STATE.address) : null);
+  var refLink = refCode ? 'https://arcsub.app/ref/' + refCode : null;
+
   var rows = DEMO_REFERRALS.map(function(r) {
     return '<tr><td class="td-mono">'+r.wallet+'</td><td>'+r.plan+'</td>'
       + '<td class="td-mono" style="color:var(--gold)">+$'+r.earned+' USDC</td>'
       + '<td style="font-size:12px;color:var(--text-1)">'+r.date+'</td>'
       + '<td><a href="https://testnet.arcscan.app/tx/'+r.tx+'" target="_blank" style="color:var(--cyan);font-family:var(--font-m);font-size:11px">'+r.tx+' &#8599;</a></td></tr>';
   }).join('');
-  el.innerHTML = '<div style="margin-bottom:26px"><h1 style="font-family:var(--font-d);font-weight:700;font-size:26px;letter-spacing:-.5px;margin-bottom:4px">Referrals</h1>'
+
+  // Referral code / link section
+  var codeSection;
+  if(!STATE.connected || !refCode) {
+    codeSection = '<div style="background:var(--bg-2);border:1px solid var(--border);border-radius:var(--r-lg);padding:28px;text-align:center">'
+      + '<div style="font-size:32px;margin-bottom:12px;opacity:.4">&#128279;</div>'
+      + '<div style="font-family:var(--font-d);font-weight:600;font-size:16px;margin-bottom:8px">Connect your wallet to get your referral code</div>'
+      + '<p style="font-size:13px;color:var(--text-1)">Your unique code is automatically generated when you connect.</p>'
+      + '</div>';
+  } else {
+    codeSection = '<div class="card" style="margin-bottom:16px">'
+      + '<div class="card-header"><span class="card-title">Your Referral Code &amp; Link</span></div>'
+      + '<div style="padding:20px 22px">'
+      + '<p style="font-size:13px;color:var(--text-1);margin-bottom:16px">Share your code or link. Earn USDC commission on every first payment from a referred subscriber.</p>'
+      // Big code display
+      + '<div style="background:var(--bg-0);border:1px solid var(--border-hi);border-radius:var(--r-lg);padding:20px 24px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between">'
+      + '<div>'
+      + '<div style="font-family:var(--font-m);font-size:10px;color:var(--text-2);letter-spacing:1px;margin-bottom:8px">YOUR REFERRAL CODE</div>'
+      + '<div style="font-family:var(--font-m);font-size:32px;font-weight:500;color:var(--cyan);letter-spacing:4px">'+refCode+'</div>'
+      + '</div>'
+      + '<button class="btn-primary" style="flex-shrink:0" onclick="navigator.clipboard.writeText(\''+refCode+'\');toast(\'Code Copied!\',\''+refCode+' copied to clipboard\',\'&#128203;\')">Copy Code</button>'
+      + '</div>'
+      // Full link
+      + '<div class="referral-link-box" onclick="navigator.clipboard.writeText(\''+refLink+'\');toast(\'Link Copied!\',\'Referral link copied to clipboard\',\'&#128203;\')">'
+      + '<span style="font-family:var(--font-m);font-size:11px;overflow:hidden;text-overflow:ellipsis">'+refLink+'</span>'
+      + '<span style="color:var(--text-2);font-size:11px;flex-shrink:0;margin-left:12px">&#128203; Copy link</span>'
+      + '</div>'
+      + '<div style="margin-top:12px;font-family:var(--font-m);font-size:11px;color:var(--text-2)">'
+      + 'Code is unique to your wallet address and permanent. Every subscriber who uses it links back to you.'
+      + '</div>'
+      + '</div></div>';
+  }
+
+  el.innerHTML = '<div style="margin-bottom:26px">'
+    + '<h1 style="font-family:var(--font-d);font-weight:700;font-size:26px;letter-spacing:-.5px;margin-bottom:4px">Referrals</h1>'
     + '<p style="font-size:13px;color:var(--text-1)">Earn USDC for every subscriber you refer</p></div>'
     + '<div class="stats-row" style="grid-template-columns:repeat(3,1fr);margin-bottom:24px">'
     + statCard('Total Earned','$4.00','All time','','linear-gradient(90deg,transparent,var(--gold),transparent)','var(--gold)')
     + statCard('Referrals','3','','','linear-gradient(90deg,transparent,var(--cyan),transparent)','var(--cyan)')
     + statCard('Pending','$1.50','Unlocks next payment','','linear-gradient(90deg,transparent,var(--green),transparent)','var(--green)')
     + '</div>'
-    + '<div class="card" style="margin-bottom:16px"><div class="card-header"><span class="card-title">Your Referral Link</span></div>'
-    + '<div style="padding:18px 22px"><p style="font-size:13px;color:var(--text-1);margin-bottom:12px">Share this link. Earn commission on every first payment.</p>'
-    + '<div class="referral-link-box" onclick="navigator.clipboard.writeText(\''+refLink+'\');toast(\'Copied!\',\'Referral link copied\',\'&#128203;\')">'
-    + '<span style="font-family:var(--font-m);font-size:11px">'+refLink+'</span>'
-    + '<span style="color:var(--text-2);font-size:11px">Click to copy</span></div></div></div>'
+    + codeSection
     + '<div class="card"><div class="card-header"><span class="card-title">Referral History</span></div>'
-    + '<div style="overflow-x:auto"><table class="data-table"><thead><tr><th>Referred</th><th>Plan</th><th>Earned</th><th>Date</th><th>Tx</th></tr></thead>'
-    + '<tbody>'+rows+'</tbody></table></div></div>';
+    + '<div style="overflow-x:auto"><table class="data-table"><thead><tr>'
+    + '<th>Referred Wallet</th><th>Plan</th><th>Earned</th><th>Date</th><th>Tx</th>'
+    + '</tr></thead><tbody>'+rows+'</tbody></table></div></div>';
 }
+
 
 // ── Change Plan modal ─────────────────────────────────────────
 function openChangePlanModal(subId) {
@@ -2311,15 +2363,89 @@ function renderMCoupons() {
       + '<td style="font-size:12px">'+c.type+'</td><td class="td-mono">'+discount+'</td>'
       + '<td class="td-mono">'+c.uses+'/'+(c.maxUses||'&#8734;')+'</td>'
       + '<td style="font-size:12px;color:var(--text-1)">'+(c.expires||'Never')+'</td>'
-      + '<td><span class="badge badge-active">active</span></td></tr>';
+      + '<td><span class="badge badge-active">active</span></td>'
+      + '<td><button class="btn-danger" style="font-size:11px;padding:4px 8px" onclick="deactivateCoupon(\''+c.code+'\')">Deactivate</button></td></tr>';
   }).join('');
   el.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:26px">'
     + '<div><h1 style="font-family:var(--font-d);font-weight:700;font-size:26px;letter-spacing:-.5px;margin-bottom:4px">Coupons &amp; Promo Codes</h1>'
     + '<p style="font-size:13px;color:var(--text-1)">Create discount codes for your subscribers</p></div>'
-    + '<button class="btn-primary" onclick="toast(\'Create Coupon\',\'Connect to API in production\',\'&#127999;\')">+ Create Coupon</button></div>'
+    + '<button class="btn-primary" onclick="toggleCouponForm()">+ Create Coupon</button></div>'
+    + '<div id="coupon-create-form" style="display:none;background:var(--bg-1);border:1px solid var(--border-hi);border-radius:var(--r-lg);padding:24px;margin-bottom:20px">'
+    + '<h2 style="font-family:var(--font-d);font-weight:600;font-size:18px;margin-bottom:18px">New Coupon</h2>'
+    + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">'
+    + '<div><label class="field-label" style="display:block;margin-bottom:6px">Coupon Code *</label>'
+    + '<input class="input" id="cc-code" placeholder="e.g. SUMMER30" maxlength="20" oninput="this.value=this.value.toUpperCase()"></div>'
+    + '<div><label class="field-label" style="display:block;margin-bottom:6px">Type *</label>'
+    + '<select class="input" id="cc-type" onchange="syncCouponTypeLabel()">'
+    + '<option value="percent">Percentage discount</option>'
+    + '<option value="fixed">Fixed amount off (USDC)</option>'
+    + '<option value="trial">Free trial extension</option>'
+    + '</select></div>'
+    + '<div id="cc-val-wrap"><label class="field-label" style="display:block;margin-bottom:6px"><span id="cc-val-lbl">Discount %</span> *</label>'
+    + '<input class="input" id="cc-value" type="number" min="1" placeholder="20"></div>'
+    + '<div><label class="field-label" style="display:block;margin-bottom:6px">Max Uses (0 = unlimited)</label>'
+    + '<input class="input" id="cc-max" type="number" min="0" value="0"></div>'
+    + '<div><label class="field-label" style="display:block;margin-bottom:6px">Expiry Date (optional)</label>'
+    + '<input class="input" id="cc-expiry" type="date"></div>'
+    + '</div>'
+    + '<div id="cc-error" style="display:none;background:var(--red-dim);border:1px solid rgba(240,80,96,.25);border-radius:var(--r-md);padding:10px 14px;font-size:12px;color:var(--red);margin-bottom:12px"></div>'
+    + '<div style="display:flex;gap:10px;justify-content:flex-end">'
+    + '<button class="btn-ghost" onclick="toggleCouponForm()">Cancel</button>'
+    + '<button class="btn-primary" onclick="submitCreateCoupon()">Create Coupon</button></div></div>'
     + '<div class="card"><div class="table-wrap"><table class="data-table"><thead><tr>'
-    + '<th>Code</th><th>Type</th><th>Discount</th><th>Uses</th><th>Expires</th><th>Status</th>'
+    + '<th>Code</th><th>Type</th><th>Discount</th><th>Uses</th><th>Expires</th><th>Status</th><th></th>'
     + '</tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+}
+
+function toggleCouponForm() {
+  var form = document.getElementById('coupon-create-form');
+  if(form) form.style.display = (form.style.display==='none'||form.style.display==='') ? 'block' : 'none';
+}
+
+function syncCouponTypeLabel() {
+  var type = document.getElementById('cc-type') ? document.getElementById('cc-type').value : 'percent';
+  var lbl  = document.getElementById('cc-val-lbl');
+  var wrap = document.getElementById('cc-val-wrap');
+  if(type==='trial') { if(wrap) wrap.style.display='none'; return; }
+  if(wrap) wrap.style.display='';
+  if(lbl) lbl.textContent = type==='percent' ? 'Discount %' : 'Amount Off (USDC)';
+}
+
+function submitCreateCoupon() {
+  var code   = document.getElementById('cc-code')   ? document.getElementById('cc-code').value.trim().toUpperCase()   : '';
+  var type   = document.getElementById('cc-type')   ? document.getElementById('cc-type').value                          : 'percent';
+  var value  = document.getElementById('cc-value')  ? parseFloat(document.getElementById('cc-value').value)||0          : 0;
+  var max    = document.getElementById('cc-max')    ? parseInt(document.getElementById('cc-max').value)||0               : 0;
+  var expiry = document.getElementById('cc-expiry') ? document.getElementById('cc-expiry').value                         : '';
+  var errEl  = document.getElementById('cc-error');
+  function showErr(msg) { if(errEl){errEl.textContent=msg;errEl.style.display='';} }
+
+  if(!code || code.length < 3)  { showErr('Coupon code must be at least 3 characters.'); return; }
+  if(DEMO_COUPONS.find(function(c){return c.code===code;})) { showErr('That code already exists.'); return; }
+  if((type==='percent'||type==='fixed') && value<=0) { showErr('Enter a valid discount value greater than 0.'); return; }
+  if(type==='percent' && value>100) { showErr('Percentage discount cannot exceed 100%.'); return; }
+  if(errEl) errEl.style.display='none';
+
+  DEMO_COUPONS.push({
+    code:     code,
+    type:     type,
+    discount: (type==='trial') ? 0 : value,
+    trialExt: (type==='trial') ? 7 : 0,
+    uses:     0,
+    maxUses:  max,
+    expires:  expiry ? new Date(expiry).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}) : null
+  });
+
+  var inputs = ['cc-code','cc-value','cc-max','cc-expiry'];
+  inputs.forEach(function(id){ var e=document.getElementById(id); if(e) e.value=''; });
+  toggleCouponForm();
+  renderMCoupons();
+  toast('Coupon Created!', code+' is now active', '&#127999;');
+}
+
+function deactivateCoupon(code) {
+  var idx = DEMO_COUPONS.findIndex(function(c){return c.code===code;});
+  if(idx>=0) { DEMO_COUPONS.splice(idx,1); renderMCoupons(); toast('Coupon removed', code+' deactivated','&#128308;'); }
 }
 
 // ── Merchant Referrals tab ────────────────────────────────────
@@ -2327,7 +2453,10 @@ function renderMReferrals() {
   var el = document.getElementById('m-referrals');
   if(!el) return;
   var rows = DEMO_REFERRALS.map(function(r) {
-    return '<tr><td class="td-mono">'+r.wallet+'</td><td>'+r.plan+'</td>'
+    var code = r.wallet ? generateReferralCode(r.wallet.replace('0x','').replace('…','aabbccdd')) : '-------';
+    return '<tr><td class="td-mono">'+r.wallet+'</td>'
+      + '<td><code style="font-family:var(--font-m);color:var(--cyan);font-size:12px;letter-spacing:2px">'+code+'</code></td>'
+      + '<td>'+r.plan+'</td>'
       + '<td class="td-mono" style="color:var(--gold)">$'+r.earned+' USDC</td>'
       + '<td style="font-size:12px;color:var(--text-1)">'+r.date+'</td>'
       + '<td><a href="https://testnet.arcscan.app/tx/'+r.tx+'" target="_blank" style="color:var(--cyan);font-family:var(--font-m);font-size:11px">'+r.tx+' &#8599;</a></td></tr>';
@@ -2340,7 +2469,7 @@ function renderMReferrals() {
     + statCard('Conv. Rate','33%','1 in 3 converts','','linear-gradient(90deg,transparent,var(--green),transparent)','var(--green)')
     + '</div>'
     + '<div class="card"><div class="card-header"><span class="card-title">Referral Events</span></div>'
-    + '<div class="table-wrap"><table class="data-table"><thead><tr><th>Referrer</th><th>Plan</th><th>Reward</th><th>Date</th><th>Tx</th></tr></thead>'
+    + '<div class="table-wrap"><table class="data-table"><thead><tr><th>Referrer</th><th>Code</th><th>Plan</th><th>Reward</th><th>Date</th><th>Tx</th></tr></thead>'
     + '<tbody>'+rows+'</tbody></table></div></div>';
 }
 
